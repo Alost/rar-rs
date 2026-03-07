@@ -1,0 +1,562 @@
+/// RarArchive — high-level RAR5 archive interface.
+///
+/// Supports opening existing archives for reading/extraction and creating
+/// new archives from scratch.
+
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::compression;
+use crate::constants::*;
+use crate::error::{RarError, RarResult};
+use crate::headers::*;
+
+/// A single entry in the archive (public API).
+#[derive(Clone, Debug)]
+pub struct ArchiveEntry {
+    pub header: FileHeader,
+}
+
+impl ArchiveEntry {
+    pub fn name(&self) -> &str {
+        &self.header.name
+    }
+
+    pub fn size(&self) -> u64 {
+        self.header.unpacked_size
+    }
+
+    pub fn compressed_size(&self) -> u64 {
+        self.header.packed_size
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.header.is_directory
+    }
+
+    pub fn crc32(&self) -> Option<u32> {
+        self.header.crc32_val
+    }
+
+    pub fn method_name(&self) -> &'static str {
+        method_name(self.header.comp_method)
+    }
+}
+
+/// RAR5 archive reader/writer.
+pub struct RarArchive {
+    path: PathBuf,
+    mode: Mode,
+    entries: Vec<ArchiveEntry>,
+    stream: Option<File>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Read,
+    Write,
+    Append,
+}
+
+impl RarArchive {
+    // ── Constructors ───────────────────────────────────────────────────────
+
+    /// Open an existing RAR5 archive for reading.
+    pub fn open(path: impl AsRef<Path>) -> RarResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut archive = RarArchive {
+            path,
+            mode: Mode::Read,
+            entries: Vec::new(),
+            stream: None,
+        };
+        archive.open_read()?;
+        Ok(archive)
+    }
+
+    /// Create a new RAR5 archive (overwrites existing file).
+    pub fn create(path: impl AsRef<Path>) -> RarResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut archive = RarArchive {
+            path,
+            mode: Mode::Write,
+            entries: Vec::new(),
+            stream: None,
+        };
+        archive.open_write()?;
+        Ok(archive)
+    }
+
+    // ── Lifecycle ──────────────────────────────────────────────────────────
+
+    fn open_read(&mut self) -> RarResult<()> {
+        let f = File::open(&self.path)?;
+        self.stream = Some(f);
+        self.verify_signature()?;
+        self.scan_blocks()?;
+        Ok(())
+    }
+
+    fn open_write(&mut self) -> RarResult<()> {
+        let f = File::create(&self.path)?;
+        self.stream = Some(f);
+        self.write_signature()?;
+        self.write_archive_header()?;
+        Ok(())
+    }
+
+    /// Finalize the archive (writes end-of-archive block in write mode).
+    pub fn close(&mut self) -> RarResult<()> {
+        if self.stream.is_some() && (self.mode == Mode::Write || self.mode == Mode::Append) {
+            self.write_end_block()?;
+            self.mode = Mode::Read; // prevent double-write
+        }
+        self.stream = None;
+        Ok(())
+    }
+
+    // ── Signature ──────────────────────────────────────────────────────────
+
+    fn verify_signature(&mut self) -> RarResult<()> {
+        let stream = self.stream.as_mut().unwrap();
+        let mut sig = [0u8; 8];
+        let n = stream.read(&mut sig)?;
+        if n < 8 {
+            return Err(RarError::Format(format!(
+                "file too short to be a RAR archive ({n} bytes read)"
+            )));
+        }
+        if sig[..7] == *RAR4_SIGNATURE && sig != *RAR5_SIGNATURE {
+            return Err(RarError::Unsupported(
+                "RAR4 format detected; rar-rs only supports RAR5".into(),
+            ));
+        }
+        if sig != *RAR5_SIGNATURE {
+            return Err(RarError::Format(format!(
+                "not a RAR5 archive (bad signature: {sig:?})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_signature(&mut self) -> RarResult<()> {
+        let stream = self.stream.as_mut().unwrap();
+        stream.write_all(RAR5_SIGNATURE)?;
+        Ok(())
+    }
+
+    // ── Block scanning ─────────────────────────────────────────────────────
+
+    fn scan_blocks(&mut self) -> RarResult<()> {
+        self.entries.clear();
+        let stream = self.stream.as_mut().unwrap();
+
+        loop {
+            let raw = match RawBlock::read_from(stream) {
+                Ok(b) => b,
+                Err(RarError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            };
+
+            let stream_pos = stream.stream_position()?;
+
+            match raw.block_type {
+                BLOCK_TYPE_ARCHIVE_HEADER => {
+                    let _ah = ArchiveHeader::from_raw(&raw)?;
+                }
+                BLOCK_TYPE_FILE_HEADER => {
+                    let fh = FileHeader::from_raw(&raw, stream_pos)?;
+                    self.entries.push(ArchiveEntry { header: fh });
+                }
+                BLOCK_TYPE_END_ARCHIVE => break,
+                BLOCK_TYPE_ENCRYPT_HEADER => {
+                    return Err(RarError::Unsupported(
+                        "archive-level encryption is not yet supported".into(),
+                    ));
+                }
+                _ => {}
+            }
+
+            if raw.data_size > 0 {
+                stream.seek(SeekFrom::Start(raw.data_offset + raw.data_size))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── Writing ────────────────────────────────────────────────────────────
+
+    fn write_archive_header(&mut self) -> RarResult<()> {
+        let hdr = ArchiveHeader {
+            flags: 0,
+            extra_data: Vec::new(),
+        };
+        let stream = self.stream.as_mut().unwrap();
+        stream.write_all(&hdr.to_bytes())?;
+        Ok(())
+    }
+
+    fn write_end_block(&mut self) -> RarResult<()> {
+        let eoa = EndOfArchiveHeader { flags: 0 };
+        let stream = self.stream.as_mut().unwrap();
+        stream.write_all(&eoa.to_bytes())?;
+        Ok(())
+    }
+
+    // ── Public API: listing ────────────────────────────────────────────────
+
+    /// Return all entries in the archive.
+    pub fn list(&self) -> &[ArchiveEntry] {
+        &self.entries
+    }
+
+    /// Find an entry by name.
+    pub fn get_entry(&self, name: &str) -> Option<&ArchiveEntry> {
+        self.entries.iter().find(|e| e.name() == name)
+    }
+
+    /// Return a list of all entry names.
+    pub fn namelist(&self) -> Vec<&str> {
+        self.entries.iter().map(|e| e.name()).collect()
+    }
+
+    // ── Public API: reading ────────────────────────────────────────────────
+
+    /// Read and return the uncompressed content of a member.
+    pub fn read(&mut self, name: &str) -> RarResult<Vec<u8>> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.name() == name)
+            .ok_or_else(|| RarError::Format(format!("member not found: {name:?}")))?
+            .clone();
+        self.decode_single_file(&entry)
+    }
+
+    /// Extract all archive contents to `dest_dir`.
+    pub fn extract_all(&mut self, dest_dir: impl AsRef<Path>) -> RarResult<()> {
+        let dest = dest_dir.as_ref();
+        let entries: Vec<_> = self.entries.clone();
+        for entry in &entries {
+            self.extract_entry(entry, dest)?;
+        }
+        Ok(())
+    }
+
+    /// Extract a single entry to `dest_dir`.
+    pub fn extract(&mut self, name: &str, dest_dir: impl AsRef<Path>) -> RarResult<PathBuf> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.name() == name)
+            .ok_or_else(|| RarError::Format(format!("member not found: {name:?}")))?
+            .clone();
+        self.extract_entry(&entry, dest_dir.as_ref())
+    }
+
+    fn extract_entry(&mut self, entry: &ArchiveEntry, dest_dir: &Path) -> RarResult<PathBuf> {
+        let dest_path = dest_dir.join(&entry.header.name);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&dest_path)?;
+            return Ok(dest_path);
+        }
+
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let data = self.decode_single_file(entry)?;
+        fs::write(&dest_path, &data)?;
+
+        // Restore mtime (best-effort)
+        if entry.header.mtime != 0 {
+            let mtime = UNIX_EPOCH + std::time::Duration::from_secs(entry.header.mtime as u64);
+            let times = std::fs::FileTimes::new().set_modified(mtime);
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(&dest_path)
+                .and_then(|f| f.set_times(times));
+        }
+
+        Ok(dest_path)
+    }
+
+    fn decode_single_file(&mut self, entry: &ArchiveEntry) -> RarResult<Vec<u8>> {
+        let hdr = &entry.header;
+        let stream = self.stream.as_mut().unwrap();
+
+        stream.seek(SeekFrom::Start(hdr.data_offset))?;
+        let mut packed_data = vec![0u8; hdr.packed_size as usize];
+        stream.read_exact(&mut packed_data)?;
+
+        let raw_data = if hdr.comp_method == COMP_METHOD_STORE {
+            packed_data
+        } else {
+            compression::decompress(
+                &packed_data,
+                hdr.comp_method,
+                hdr.unpacked_size,
+                hdr.comp_dict_size,
+                None,
+            )
+            .map_err(|e| RarError::Unsupported(e))?
+        };
+
+        // Verify CRC
+        if let Some(expected_crc) = hdr.crc32_val {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&raw_data);
+            let actual_crc = hasher.finalize();
+            if actual_crc != expected_crc {
+                return Err(RarError::Crc {
+                    expected: expected_crc,
+                    actual: actual_crc,
+                    context: hdr.name.clone(),
+                });
+            }
+        }
+
+        Ok(raw_data)
+    }
+
+    // ── Public API: creation ───────────────────────────────────────────────
+
+    /// Add a file from the filesystem to the archive.
+    pub fn add(
+        &mut self,
+        path: impl AsRef<Path>,
+        compression_level: u8,
+    ) -> RarResult<()> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(RarError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("path not found: {}", path.display()),
+            )));
+        }
+
+        if path.is_dir() {
+            self.add_directory(path, None, true, compression_level)
+        } else {
+            self.add_file(path, None, compression_level)
+        }
+    }
+
+    fn add_file(
+        &mut self,
+        path: &Path,
+        arcname: Option<&str>,
+        level: u8,
+    ) -> RarResult<()> {
+        let raw_data = fs::read(path)?;
+        let file_crc = {
+            let mut h = crc32fast::Hasher::new();
+            h.update(&raw_data);
+            h.finalize()
+        };
+
+        let method = level_to_method(level);
+        let (packed_data, actual_method, dict_size_log) = if method == COMP_METHOD_STORE {
+            (raw_data.clone(), COMP_METHOD_STORE, 0u8)
+        } else {
+            let dsl = dict_size_for_data(raw_data.len());
+            let compressed = compression::compress(&raw_data, method, dsl)
+                .map_err(|e| RarError::Unsupported(e))?;
+            if compressed.len() >= raw_data.len() {
+                (raw_data.clone(), COMP_METHOD_STORE, 0u8)
+            } else {
+                (compressed, method, dsl)
+            }
+        };
+
+        let name = arcname
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().into_owned());
+        let name = name.replace('\\', "/");
+
+        let meta = fs::metadata(path)?;
+        let mtime = meta
+            .modified()
+            .unwrap_or(SystemTime::now())
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+
+        #[cfg(unix)]
+        let attrs = {
+            use std::os::unix::fs::MetadataExt;
+            meta.mode() as u64
+        };
+        #[cfg(not(unix))]
+        let attrs = 0o100644u64;
+
+        let fh = FileHeader {
+            name: name.clone(),
+            unpacked_size: raw_data.len() as u64,
+            packed_size: packed_data.len() as u64,
+            attributes: attrs,
+            mtime,
+            crc32_val: Some(file_crc),
+            comp_method: actual_method,
+            comp_dict_size: dict_size_log,
+            host_os: OS_UNIX,
+            file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
+            ..Default::default()
+        };
+
+        let stream = self.stream.as_mut().unwrap();
+        stream.write_all(&fh.to_bytes())?;
+        stream.write_all(&packed_data)?;
+
+        self.entries.push(ArchiveEntry {
+            header: FileHeader {
+                data_offset: stream.stream_position()? - packed_data.len() as u64,
+                ..fh
+            },
+        });
+
+        Ok(())
+    }
+
+    fn add_directory(
+        &mut self,
+        path: &Path,
+        arcname: Option<&str>,
+        recursive: bool,
+        level: u8,
+    ) -> RarResult<()> {
+        let name = arcname
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path.file_name().unwrap().to_string_lossy().into_owned());
+        let name = name.replace('\\', "/").trim_end_matches('/').to_string() + "/";
+
+        let meta = fs::metadata(path)?;
+        let mtime = meta
+            .modified()
+            .unwrap_or(SystemTime::now())
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+
+        #[cfg(unix)]
+        let attrs = {
+            use std::os::unix::fs::MetadataExt;
+            meta.mode() as u64
+        };
+        #[cfg(not(unix))]
+        let attrs = 0o040755u64;
+
+        let fh = FileHeader {
+            name: name.clone(),
+            attributes: attrs,
+            mtime,
+            host_os: OS_UNIX,
+            file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_DIRECTORY,
+            is_directory: true,
+            ..Default::default()
+        };
+
+        let stream = self.stream.as_mut().unwrap();
+        stream.write_all(&fh.to_bytes())?;
+        self.entries.push(ArchiveEntry { header: fh });
+
+        if recursive {
+            let mut children: Vec<_> = fs::read_dir(path)?
+                .filter_map(|e| e.ok())
+                .collect();
+            children.sort_by_key(|e| e.file_name());
+
+            for child in children {
+                let child_path = child.path();
+                let child_name = format!("{}{}", name, child.file_name().to_string_lossy());
+                if child_path.is_dir() {
+                    self.add_directory(&child_path, Some(&child_name), true, level)?;
+                } else {
+                    self.add_file(&child_path, Some(&child_name), level)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Add raw bytes as a named file in the archive.
+    pub fn add_bytes(
+        &mut self,
+        arcname: &str,
+        data: &[u8],
+        compression_level: u8,
+    ) -> RarResult<()> {
+        let file_crc = {
+            let mut h = crc32fast::Hasher::new();
+            h.update(data);
+            h.finalize()
+        };
+
+        let method = level_to_method(compression_level);
+        let mtime = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+
+        let (packed_data, actual_method, dict_size_log) = if method == COMP_METHOD_STORE {
+            (data.to_vec(), COMP_METHOD_STORE, 0u8)
+        } else {
+            let dsl = dict_size_for_data(data.len());
+            let compressed = compression::compress(data, method, dsl)
+                .map_err(|e| RarError::Unsupported(e))?;
+            if compressed.len() >= data.len() {
+                (data.to_vec(), COMP_METHOD_STORE, 0u8)
+            } else {
+                (compressed, method, dsl)
+            }
+        };
+
+        let name = arcname.replace('\\', "/");
+        let fh = FileHeader {
+            name: name.clone(),
+            unpacked_size: data.len() as u64,
+            packed_size: packed_data.len() as u64,
+            attributes: 0o100644,
+            mtime,
+            crc32_val: Some(file_crc),
+            comp_method: actual_method,
+            comp_dict_size: dict_size_log,
+            host_os: OS_UNIX,
+            file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
+            ..Default::default()
+        };
+
+        let stream = self.stream.as_mut().unwrap();
+        stream.write_all(&fh.to_bytes())?;
+        stream.write_all(&packed_data)?;
+
+        self.entries.push(ArchiveEntry {
+            header: FileHeader {
+                data_offset: stream.stream_position()? - packed_data.len() as u64,
+                ..fh
+            },
+        });
+
+        Ok(())
+    }
+}
+
+impl Drop for RarArchive {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn dict_size_for_data(data_size: usize) -> u8 {
+    let base = 128 * 1024;
+    let mut log = 0u8;
+    while (base << log) < data_size && log < 15 {
+        log += 1;
+    }
+    log
+}

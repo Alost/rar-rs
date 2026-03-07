@@ -1,0 +1,470 @@
+/// RAR5 block and header data structures.
+///
+/// Every RAR5 block shares the same outer envelope:
+/// ```text
+/// [Header CRC32]  4 bytes LE
+/// [Header Size]   vint — bytes after this field
+/// [Header Type]   vint
+/// [Header Flags]  vint
+/// [Extra Size]    vint — if BLOCK_FLAG_EXTRA_DATA
+/// [Data Size]     vint — if BLOCK_FLAG_DATA_AREA
+/// ... type-specific fields ...
+/// [Extra Area]    bytes — if present
+/// ```
+
+use std::io::{self, Read, Seek};
+
+use crate::constants::*;
+use crate::error::{RarError, RarResult};
+use crate::vint;
+
+// ── Raw Block ──────────────────────────────────────────────────────────────
+
+/// A raw, unparsed RAR5 block as read from the archive stream.
+pub struct RawBlock {
+    pub header_crc: u32,
+    pub header_data: Vec<u8>,
+    pub data_size: u64,
+    pub data_offset: u64,
+    pub block_type: u64,
+    pub flags: u64,
+}
+
+impl RawBlock {
+    /// Read the next raw block from the stream.
+    /// Validates the header CRC32.
+    pub fn read_from<R: Read + Seek>(r: &mut R) -> RarResult<Self> {
+        // Read 4-byte header CRC32
+        let mut crc_buf = [0u8; 4];
+        r.read_exact(&mut crc_buf).map_err(|_| {
+            RarError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stream ended reading block CRC",
+            ))
+        })?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+
+        // Read header size (vint)
+        let header_size = vint::read(r).map_err(|e| RarError::Format(format!("bad vint: {e}")))?;
+        if header_size == 0 || header_size > 2 * 1024 * 1024 {
+            return Err(RarError::Format(format!(
+                "implausible header size: {header_size}"
+            )));
+        }
+
+        // Read the entire header body
+        let mut header_data = vec![0u8; header_size as usize];
+        r.read_exact(&mut header_data)?;
+
+        // Validate CRC over size_bytes + header_body
+        let size_bytes = vint::encode(header_size);
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&size_bytes);
+        hasher.update(&header_data);
+        let computed_crc = hasher.finalize();
+        if computed_crc != stored_crc {
+            return Err(RarError::Crc {
+                expected: stored_crc,
+                actual: computed_crc,
+                context: "block header".into(),
+            });
+        }
+
+        // Parse type and flags
+        let mut offset = 0usize;
+        let (block_type, n) = vint::decode_from_slice(&header_data, offset)
+            .map_err(|e| RarError::Format(format!("block type: {e}")))?;
+        offset += n;
+        let (flags, n) = vint::decode_from_slice(&header_data, offset)
+            .map_err(|e| RarError::Format(format!("block flags: {e}")))?;
+        offset += n;
+
+        // Extra area and data area sizes
+        let mut _extra_size = 0u64;
+        let mut data_size = 0u64;
+        if flags & BLOCK_FLAG_EXTRA_DATA != 0 {
+            let (v, n) = vint::decode_from_slice(&header_data, offset)
+                .map_err(|e| RarError::Format(format!("extra size: {e}")))?;
+            _extra_size = v;
+            offset += n;
+        }
+        if flags & BLOCK_FLAG_DATA_AREA != 0 {
+            let (v, n) = vint::decode_from_slice(&header_data, offset)
+                .map_err(|e| RarError::Format(format!("data size: {e}")))?;
+            data_size = v;
+            offset += n;
+        }
+        let _ = offset; // remaining header_data parsed by typed header
+
+        let data_offset = r.stream_position()?;
+
+        Ok(RawBlock {
+            header_crc: stored_crc,
+            header_data,
+            data_size,
+            data_offset,
+            block_type,
+            flags,
+        })
+    }
+}
+
+// ── Archive Header ─────────────────────────────────────────────────────────
+
+/// RAR5 Main Archive Header (block type 0x01).
+pub struct ArchiveHeader {
+    pub flags: u64,
+    pub extra_data: Vec<u8>,
+}
+
+impl ArchiveHeader {
+    /// Serialize to RAR5 binary format (including CRC).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(vint::encode(BLOCK_TYPE_ARCHIVE_HEADER));
+
+        let mut eff_flags = 0u64;
+        if !self.extra_data.is_empty() {
+            eff_flags |= BLOCK_FLAG_EXTRA_DATA;
+        }
+        body.extend(vint::encode(eff_flags));
+
+        if !self.extra_data.is_empty() {
+            body.extend(vint::encode(self.extra_data.len() as u64));
+        }
+        body.extend(vint::encode(self.flags & 0xFFFF));
+        body.extend(&self.extra_data);
+
+        let size_bytes = vint::encode(body.len() as u64);
+        let mut header_content = Vec::with_capacity(size_bytes.len() + body.len());
+        header_content.extend(&size_bytes);
+        header_content.extend(&body);
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header_content);
+        let crc = hasher.finalize();
+
+        let mut result = Vec::with_capacity(4 + header_content.len());
+        result.extend(crc.to_le_bytes());
+        result.extend(header_content);
+        result
+    }
+
+    /// Parse from a [`RawBlock`].
+    pub fn from_raw(raw: &RawBlock) -> RarResult<Self> {
+        let data = &raw.header_data;
+        let mut offset = 0;
+
+        let (_, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+        let (block_flags, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+
+        let mut extra_size = 0u64;
+        if block_flags & BLOCK_FLAG_EXTRA_DATA != 0 {
+            let (v, n) = vint::decode_from_slice(data, offset)
+                .map_err(|e| RarError::Format(e.to_string()))?;
+            extra_size = v;
+            offset += n;
+        }
+
+        let (arch_flags, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+
+        let extra_data = if extra_size > 0 && offset < data.len() {
+            let end = (offset + extra_size as usize).min(data.len());
+            data[offset..end].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        Ok(ArchiveHeader {
+            flags: arch_flags,
+            extra_data,
+        })
+    }
+}
+
+// ── File Header ────────────────────────────────────────────────────────────
+
+/// RAR5 File Header (block type 0x02).
+#[derive(Clone, Debug)]
+pub struct FileHeader {
+    pub name: String,
+    pub unpacked_size: u64,
+    pub packed_size: u64,
+    pub attributes: u64,
+    pub mtime: u32,
+    pub crc32_val: Option<u32>,
+    pub comp_method: u8,
+    pub comp_version: u8,
+    pub comp_solid: bool,
+    pub comp_dict_size: u8,
+    pub host_os: u64,
+    pub flags: u64,
+    pub file_flags: u64,
+    pub extra_data: Vec<u8>,
+    pub is_directory: bool,
+    pub data_offset: u64,
+}
+
+impl Default for FileHeader {
+    fn default() -> Self {
+        FileHeader {
+            name: String::new(),
+            unpacked_size: 0,
+            packed_size: 0,
+            attributes: 0o100644,
+            mtime: 0,
+            crc32_val: None,
+            comp_method: COMP_METHOD_STORE,
+            comp_version: 0,
+            comp_solid: false,
+            comp_dict_size: 0,
+            host_os: OS_UNIX,
+            flags: 0,
+            file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
+            extra_data: Vec::new(),
+            is_directory: false,
+            data_offset: 0,
+        }
+    }
+}
+
+impl FileHeader {
+    /// Serialize to RAR5 binary format (including CRC).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(vint::encode(BLOCK_TYPE_FILE_HEADER));
+
+        let mut eff_file_flags = self.file_flags;
+        if self.is_directory {
+            eff_file_flags |= FILE_FLAG_DIRECTORY;
+        }
+        if self.crc32_val.is_none() {
+            eff_file_flags &= !FILE_FLAG_CRC32;
+        }
+
+        let mut eff_block_flags = self.flags;
+        if !self.extra_data.is_empty() {
+            eff_block_flags |= BLOCK_FLAG_EXTRA_DATA;
+        }
+        if self.packed_size > 0 && !self.is_directory {
+            eff_block_flags |= BLOCK_FLAG_DATA_AREA;
+        }
+
+        body.extend(vint::encode(eff_block_flags));
+
+        if !self.extra_data.is_empty() {
+            body.extend(vint::encode(self.extra_data.len() as u64));
+        }
+        if eff_block_flags & BLOCK_FLAG_DATA_AREA != 0 {
+            body.extend(vint::encode(self.packed_size));
+        }
+
+        body.extend(vint::encode(eff_file_flags));
+        body.extend(vint::encode(self.unpacked_size));
+        body.extend(vint::encode(self.attributes));
+
+        if eff_file_flags & FILE_FLAG_TIME_UNIX != 0 {
+            body.extend(self.mtime.to_le_bytes());
+        }
+        if eff_file_flags & FILE_FLAG_CRC32 != 0 {
+            if let Some(crc) = self.crc32_val {
+                body.extend(crc.to_le_bytes());
+            }
+        }
+
+        // Compression info
+        let mut comp_info: u64 = (self.comp_version as u64) & 0x3F;
+        if self.comp_solid {
+            comp_info |= COMP_INFO_SOLID_BIT;
+        }
+        comp_info |= ((self.comp_method as u64) & 0x07) << COMP_INFO_METHOD_SHIFT;
+        comp_info |= ((self.comp_dict_size as u64) & 0x0F) << COMP_INFO_DICT_SHIFT;
+        body.extend(vint::encode(comp_info));
+        body.extend(vint::encode(self.host_os));
+
+        let name_bytes = self.name.as_bytes();
+        body.extend(vint::encode(name_bytes.len() as u64));
+        body.extend(name_bytes);
+
+        body.extend(&self.extra_data);
+
+        let size_bytes = vint::encode(body.len() as u64);
+        let mut header_content = Vec::with_capacity(size_bytes.len() + body.len());
+        header_content.extend(&size_bytes);
+        header_content.extend(&body);
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header_content);
+        let crc = hasher.finalize();
+
+        let mut result = Vec::with_capacity(4 + header_content.len());
+        result.extend(crc.to_le_bytes());
+        result.extend(header_content);
+        result
+    }
+
+    /// Parse from a [`RawBlock`] with the given stream position.
+    pub fn from_raw(raw: &RawBlock, stream_pos: u64) -> RarResult<Self> {
+        let data = &raw.header_data;
+        let mut offset = 0;
+
+        let (_, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+        let (block_flags, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+
+        let mut extra_size = 0u64;
+        let mut data_size = 0u64;
+        if block_flags & BLOCK_FLAG_EXTRA_DATA != 0 {
+            let (v, n) = vint::decode_from_slice(data, offset)
+                .map_err(|e| RarError::Format(e.to_string()))?;
+            extra_size = v;
+            offset += n;
+        }
+        if block_flags & BLOCK_FLAG_DATA_AREA != 0 {
+            let (v, n) = vint::decode_from_slice(data, offset)
+                .map_err(|e| RarError::Format(e.to_string()))?;
+            data_size = v;
+            offset += n;
+        }
+
+        let (file_flags, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+        let (unpacked_size, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+        let (attributes, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+
+        let mut mtime = 0u32;
+        if file_flags & FILE_FLAG_TIME_UNIX != 0 {
+            if offset + 4 > data.len() {
+                return Err(RarError::Format("truncated mtime".into()));
+            }
+            mtime = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+        }
+
+        let mut crc32_val = None;
+        if file_flags & FILE_FLAG_CRC32 != 0 {
+            if offset + 4 > data.len() {
+                return Err(RarError::Format("truncated CRC32".into()));
+            }
+            crc32_val = Some(u32::from_le_bytes(
+                data[offset..offset + 4].try_into().unwrap(),
+            ));
+            offset += 4;
+        }
+
+        let (comp_info, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+        let comp_version = (comp_info & COMP_INFO_VERSION_MASK) as u8;
+        let comp_solid = comp_info & COMP_INFO_SOLID_BIT != 0;
+        let comp_method = ((comp_info & COMP_INFO_METHOD_MASK) >> COMP_INFO_METHOD_SHIFT) as u8;
+        let comp_dict_size = ((comp_info & COMP_INFO_DICT_MASK) >> COMP_INFO_DICT_SHIFT) as u8;
+
+        let (host_os, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+        let (name_len, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+
+        let name_end = (offset + name_len as usize).min(data.len());
+        let name = String::from_utf8_lossy(&data[offset..name_end]).into_owned();
+        offset = name_end;
+
+        let extra_data = if extra_size > 0 && offset < data.len() {
+            let end = (offset + extra_size as usize).min(data.len());
+            data[offset..end].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let is_directory = file_flags & FILE_FLAG_DIRECTORY != 0;
+
+        Ok(FileHeader {
+            name,
+            unpacked_size,
+            packed_size: data_size,
+            attributes,
+            mtime,
+            crc32_val,
+            comp_method,
+            comp_version,
+            comp_solid,
+            comp_dict_size,
+            host_os,
+            flags: block_flags,
+            file_flags,
+            extra_data,
+            is_directory,
+            data_offset: stream_pos,
+        })
+    }
+}
+
+// ── End of Archive Header ──────────────────────────────────────────────────
+
+/// RAR5 End of Archive Header (block type 0x05).
+pub struct EndOfArchiveHeader {
+    pub flags: u64,
+}
+
+impl EndOfArchiveHeader {
+    /// Serialize to RAR5 binary format.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(vint::encode(BLOCK_TYPE_END_ARCHIVE));
+        body.extend(vint::encode(self.flags));
+        body.extend(vint::encode(self.flags & 0xFF));
+
+        let size_bytes = vint::encode(body.len() as u64);
+        let mut header_content = Vec::with_capacity(size_bytes.len() + body.len());
+        header_content.extend(&size_bytes);
+        header_content.extend(&body);
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&header_content);
+        let crc = hasher.finalize();
+
+        let mut result = Vec::with_capacity(4 + header_content.len());
+        result.extend(crc.to_le_bytes());
+        result.extend(header_content);
+        result
+    }
+
+    /// Parse from a [`RawBlock`].
+    pub fn from_raw(raw: &RawBlock) -> RarResult<Self> {
+        let data = &raw.header_data;
+        let mut offset = 0;
+
+        let (_, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+        let (_, n) =
+            vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
+        offset += n;
+
+        let end_flags = if offset < data.len() {
+            let (v, _) = vint::decode_from_slice(data, offset)
+                .map_err(|e| RarError::Format(e.to_string()))?;
+            v
+        } else {
+            0
+        };
+
+        Ok(EndOfArchiveHeader { flags: end_flags })
+    }
+}

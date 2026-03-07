@@ -1,0 +1,51 @@
+LEGAL NOTICE
+=============
+
+rar-rs is a clean-room Rust implementation of the RAR5 archive format for
+software conservancy and educational purposes, providing BSD-2-Clause licensed
+`rar` and `unrar` command-line tools.
+
+Clean-Room Implementation
+--------------------------
+
+The RAR5 LZSS+Huffman compression codec (src/codec/) was developed as a
+clean-room implementation. The bitstream format was derived from analysis of
+libarchive's archive_read_support_format_rar5.c by Grzegorz Antoniak (2018),
+which is itself an independent BSD-2-Clause licensed implementation of a RAR5
+decompressor. No proprietary RARLAB source code was used or referenced.
+
+This project does not contain, link to, or derive from the proprietary unrar
+source code distributed by RARLAB under its restrictive license. The archive
+header and block structure implementation is based on the publicly documented
+RAR5 format specification.
+
+Scope and Limitations
+----------------------
+
+This software:
+
+  - Does NOT support encrypted archive creation or reading.
+
+  - Does NOT supersede, replace, or replicate the full capabilities of the
+    native RAR archiver produced by RARLAB (Alexander Roshal). The proprietary
+    RAR encoder uses advanced techniques (including optimal parsing, context
+    modelling, and PPMd) that this implementation does not attempt to reproduce.
+    Compression ratios will vary; this implementation may produce larger output
+    than the native tool in many real-world scenarios.
+
+  - Is intended for software conservancy, interoperability, and educational use.
+    It enables reading and writing of the RAR5 archive format without depending
+    on proprietary binaries.
+
+Trademarks
+-----------
+
+RAR and WinRAR are registered trademarks of Alexander Roshal and RARLAB.
+This project is not affiliated with, endorsed by, or connected to RARLAB
+in any way.
+
+License
+--------
+
+This project is licensed under the BSD 2-Clause License. See the LICENSE file
+for the full text.

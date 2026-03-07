@@ -1,0 +1,116 @@
+# rar-rs
+
+Pure-Rust RAR5 archive library and tools. Creates, reads, and extracts RAR5
+archives with native LZSS+Huffman compression — no external binaries required.
+
+**License:** BSD-2-Clause — see [NOTICE](NOTICE) for legal details.
+
+---
+
+## Features
+
+| Feature                            | Status |
+|------------------------------------|--------|
+| Create RAR5 archives               |   done |
+| Extract RAR5 archives              |   done |
+| Native LZSS+Huffman compression    |   done |
+| Compression levels 0-5             |   done |
+| CRC32 integrity verification       |   done |
+| Directory entries                  |   done |
+| Timestamp preservation             |   done |
+| Solid archive decompression        |   todo |
+| File-level AES-256 decryption      |   todo |
+| Multi-volume archives              |   todo |
+
+Archives produced by rar-rs are fully interoperable with WinRAR and unrar.
+
+---
+
+## CLI Tools
+
+### rar
+
+```
+rar a archive.rar files...     Create archive
+rar l archive.rar              List contents
+rar i archive.rar              Show info
+```
+
+### unrar
+
+```
+unrar x archive.rar [dest/]    Extract with full paths
+unrar e archive.rar [dest/]    Extract flat
+unrar l archive.rar            List contents
+unrar t archive.rar            Test integrity
+unrar p archive.rar [file]     Print to stdout
+```
+
+---
+
+## Library Usage
+
+```rust
+use rar5::RarArchive;
+
+// Create
+let mut rar = RarArchive::create("backup.rar")?;
+rar.add("src/", 3)?;
+rar.add_bytes("notes.txt", b"Some notes", 3)?;
+rar.close()?;
+
+// Extract
+let mut rar = RarArchive::open("backup.rar")?;
+rar.extract_all("/tmp/output/")?;
+
+// Read a single file
+let mut rar = RarArchive::open("backup.rar")?;
+let data = rar.read("notes.txt")?;
+```
+
+---
+
+## Module Layout
+
+```
+src/
++-- lib.rs              Public API
++-- archive.rs          RarArchive high-level interface
++-- headers.rs          Block/header structs
++-- compression.rs      Compress/decompress dispatch
++-- constants.rs        RAR5 format constants
++-- vint.rs             Variable-length integer codec
++-- error.rs            Error types
++-- codec/
+|   +-- mod.rs          Codec public API
+|   +-- decoder.rs      Block decoder + symbol stream
+|   +-- encoder.rs      Block encoder + match finder
+|   +-- bitstream.rs    MSB-first bit reader/writer
+|   +-- huffman.rs      Canonical Huffman tables
+|   +-- window.rs       Sliding window buffer
+|   +-- filters.rs      Delta, E8, E8E9, ARM filters
+|   +-- lz_match.rs     Hash-chain match finder
+|   +-- tables.rs       Symbol/table constants
++-- bin/
+    +-- rar.rs          CLI archive creator
+    +-- unrar.rs        CLI archive extractor
+```
+
+---
+
+## Building
+
+```bash
+cargo build --release
+```
+
+Binaries are at `target/release/rar` and `target/release/unrar`.
+
+---
+
+## Legal
+
+This is a clean-room implementation for software conservancy and educational
+purposes. See [NOTICE](NOTICE) for the full legal notice, including trademark
+attribution and scope limitations. Licensed under BSD-2-Clause — see
+[LICENSE](LICENSE).

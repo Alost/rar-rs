@@ -1,0 +1,43 @@
+/// RAR5 compression engine — dispatches to store or native LZSS+Huffman codec.
+
+use crate::codec;
+use crate::constants::*;
+
+/// Compress `data` using the specified RAR5 compression method.
+pub fn compress(data: &[u8], method: u8, dict_size_log: u8) -> Result<Vec<u8>, String> {
+    if method == COMP_METHOD_STORE {
+        return Ok(data.to_vec());
+    }
+    if method >= COMP_METHOD_FASTEST && method <= COMP_METHOD_BEST {
+        return Ok(codec::encode(data, method, dict_size_log));
+    }
+    Err(format!("unknown compression method: {method}"))
+}
+
+/// Decompress `data` using the specified RAR5 compression method.
+pub fn decompress(
+    data: &[u8],
+    method: u8,
+    unpacked_size: u64,
+    dict_size_log: u8,
+    state: Option<&mut codec::DecoderState>,
+) -> Result<Vec<u8>, String> {
+    if method == COMP_METHOD_STORE {
+        return Ok(data.to_vec());
+    }
+    if method >= COMP_METHOD_FASTEST && method <= COMP_METHOD_BEST {
+        let result = if let Some(st) = state {
+            codec::decode(data, unpacked_size, dict_size_log, Some(st))?
+        } else {
+            codec::decode_standalone(data, unpacked_size, dict_size_log)?
+        };
+        if result.len() != unpacked_size as usize {
+            return Err(format!(
+                "decompressed size mismatch: expected {unpacked_size}, got {}",
+                result.len()
+            ));
+        }
+        return Ok(result);
+    }
+    Err(format!("unknown compression method: {method}"))
+}
