@@ -175,6 +175,15 @@ impl BitWriter {
     pub fn bytes_so_far(&self) -> &[u8] {
         &self.buf
     }
+
+    /// Get a copy of all written bytes including the current partial byte.
+    pub fn clone_bytes(&self) -> Vec<u8> {
+        let mut v = self.buf.clone();
+        if self.bit_pos > 0 {
+            v.push(self.current_byte);
+        }
+        v
+    }
 }
 
 #[cfg(test)]

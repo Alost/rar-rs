@@ -293,11 +293,52 @@ pub fn build_code_lengths_from_freqs(freqs: &[u32], max_length: usize) -> Vec<u8
     let root_idx = all_nodes.len() - 1;
     walk(&all_nodes, root_idx, 0, total_leaves, &mut lengths);
 
-    // Enforce max_length
+    // Enforce max_length and fix Kraft inequality.
+    // Clamping depths > max_length to max_length makes the code overcomplete
+    // (Kraft sum > 1). To fix, we lengthen some shorter codes (increase their
+    // bit length) which reduces their Kraft contribution.
     let max_len = max_length as u8;
+    let mut needs_fix = false;
     for l in &mut lengths {
         if *l > max_len {
             *l = max_len;
+            needs_fix = true;
+        }
+    }
+
+    if needs_fix {
+        let kraft_target: u64 = 1u64 << max_len;
+        let kraft_sum_fn = |lengths: &[u8]| -> u64 {
+            lengths
+                .iter()
+                .filter(|&&l| l > 0)
+                .map(|&l| 1u64 << (max_len - l))
+                .sum()
+        };
+
+        // Lengthen shortest codes to reduce Kraft sum.
+        // Each lengthening of a code from L to L+1 reduces the Kraft sum
+        // by 2^(max_len - L - 1).
+        while kraft_sum_fn(&lengths) > kraft_target {
+            // Find the shortest non-zero, non-max code to lengthen
+            let shortest = lengths
+                .iter()
+                .filter(|&&l| l > 0 && l < max_len)
+                .copied()
+                .min();
+            match shortest {
+                Some(s) => {
+                    // Lengthen the least-frequent symbol at this length
+                    // (last occurrence, which tends to be a less important symbol)
+                    for i in (0..n).rev() {
+                        if lengths[i] == s {
+                            lengths[i] += 1;
+                            break;
+                        }
+                    }
+                }
+                None => break, // All codes at max_len, can't fix further
+            }
         }
     }
 

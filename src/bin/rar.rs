@@ -36,27 +36,43 @@ fn usage() {
     eprintln!("rar-rs — create RAR5 archives");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  rar a <archive.rar> <files...>   Create archive from files");
+    eprintln!("  rar a [-m0..-m5] <archive.rar> <files...>   Create archive");
     eprintln!("  rar l <archive.rar>              List archive contents");
     eprintln!("  rar i <archive.rar>              Show archive info");
 }
 
 fn cmd_create(args: &[String]) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err("usage: rar a <archive.rar> <files...>".into());
+    let mut level: u8 = 3;
+    let mut positional = Vec::new();
+
+    for arg in args {
+        if let Some(rest) = arg.strip_prefix("-m") {
+            level = rest
+                .parse::<u8>()
+                .map_err(|_| format!("invalid compression level: {arg}"))?;
+            if level > 5 {
+                return Err(format!("compression level must be 0-5, got {level}"));
+            }
+        } else {
+            positional.push(arg.as_str());
+        }
     }
-    let archive_path = &args[0];
-    let files = &args[1..];
+
+    if positional.len() < 2 {
+        return Err("usage: rar a [-m0..-m5] <archive.rar> <files...>".into());
+    }
+    let archive_path = positional[0];
+    let files = &positional[1..];
 
     let mut rar =
         rar5::RarArchive::create(archive_path).map_err(|e| format!("create: {e}"))?;
 
     for file in files {
-        rar.add(file, 3).map_err(|e| format!("add {file}: {e}"))?;
+        rar.add(file, level).map_err(|e| format!("add {file}: {e}"))?;
     }
 
     rar.close().map_err(|e| format!("close: {e}"))?;
-    println!("Created {archive_path} ({} file(s))", files.len());
+    println!("Created {archive_path} ({} file(s), level {level})", files.len());
     Ok(())
 }
 

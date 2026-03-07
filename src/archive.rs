@@ -8,6 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::codec::DecoderState;
 use crate::compression;
 use crate::constants::*;
 use crate::error::{RarError, RarResult};
@@ -51,6 +52,10 @@ pub struct RarArchive {
     mode: Mode,
     entries: Vec<ArchiveEntry>,
     stream: Option<File>,
+    /// Persistent decoder state for solid archive chains.
+    solid_state: Option<DecoderState>,
+    /// Index of the last file decoded in the solid chain (-1 = none).
+    solid_decoded_through: isize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -71,6 +76,8 @@ impl RarArchive {
             mode: Mode::Read,
             entries: Vec::new(),
             stream: None,
+            solid_state: None,
+            solid_decoded_through: -1,
         };
         archive.open_read()?;
         Ok(archive)
@@ -84,6 +91,8 @@ impl RarArchive {
             mode: Mode::Write,
             entries: Vec::new(),
             stream: None,
+            solid_state: None,
+            solid_decoded_through: -1,
         };
         archive.open_write()?;
         Ok(archive)
@@ -286,9 +295,118 @@ impl RarArchive {
     }
 
     fn decode_single_file(&mut self, entry: &ArchiveEntry) -> RarResult<Vec<u8>> {
-        let hdr = &entry.header;
-        let stream = self.stream.as_mut().unwrap();
+        // Find the index of this entry
+        let target_idx = self
+            .entries
+            .iter()
+            .position(|e| e.header.data_offset == entry.header.data_offset)
+            .unwrap_or(0);
 
+        // Check if this entry is part of a solid chain
+        if self.is_solid_chain_member(target_idx) {
+            return self.decode_solid_through(target_idx);
+        }
+
+        self.decode_file_at(target_idx, None)
+    }
+
+    /// Check if entry at `idx` is in a solid chain (is solid itself, or
+    /// the next entry after it is solid).
+    fn is_solid_chain_member(&self, idx: usize) -> bool {
+        let hdr = &self.entries[idx].header;
+        if hdr.comp_solid {
+            return true;
+        }
+        // First file in a solid group isn't flagged solid but the next one is
+        if idx + 1 < self.entries.len() && self.entries[idx + 1].header.comp_solid {
+            return true;
+        }
+        false
+    }
+
+    /// Decode all files in the solid chain up through `target_idx`,
+    /// returning the data for `target_idx`.
+    fn decode_solid_through(&mut self, target_idx: usize) -> RarResult<Vec<u8>> {
+        // Find the start of the solid chain (first non-directory file
+        // at or before target_idx that isn't solid, followed by solid files)
+        let mut chain_start = target_idx;
+        for i in (0..target_idx).rev() {
+            if self.entries[i].is_dir() {
+                continue;
+            }
+            if self.entries[i].header.comp_solid || self.is_solid_chain_member(i) {
+                chain_start = i;
+            } else {
+                break;
+            }
+        }
+
+        // If we've already decoded past this point, and it's a forward request, reuse state.
+        // If we need to go backwards, reset.
+        if self.solid_decoded_through >= chain_start as isize
+            && self.solid_decoded_through < target_idx as isize
+        {
+            // Continue from where we left off
+        } else if self.solid_decoded_through >= target_idx as isize {
+            // Already decoded this file — but we don't cache the output,
+            // so we must restart from the beginning.
+            self.solid_state = None;
+            self.solid_decoded_through = -1;
+        } else {
+            // Starting fresh
+            self.solid_state = None;
+            self.solid_decoded_through = -1;
+        }
+
+        // Determine dict_size from the first compressed entry in the chain
+        if self.solid_state.is_none() {
+            let dict_log = self.entries[chain_start].header.comp_dict_size;
+            let dict_log32 = dict_log.max(0) as u32;
+            let mut dict_size = 128 * 1024 * (1usize << dict_log32);
+            if !dict_size.is_power_of_two() {
+                dict_size = dict_size.next_power_of_two();
+            }
+            self.solid_state = Some(DecoderState::new(dict_size));
+        }
+
+        let start_from = (self.solid_decoded_through + 1) as usize;
+        let mut target_data = Vec::new();
+
+        for i in start_from..=target_idx {
+            let entry = self.entries[i].clone();
+            if entry.is_dir() {
+                continue;
+            }
+
+            // Temporarily take state to satisfy borrow checker
+            let mut state = self.solid_state.take().unwrap();
+            let data = self.decode_file_at(i, Some(&mut state))?;
+            self.solid_state = Some(state);
+
+            self.solid_decoded_through = i as isize;
+
+            if i == target_idx {
+                target_data = data;
+            }
+        }
+
+        Ok(target_data)
+    }
+
+    /// Decode a single file, optionally with a shared DecoderState.
+    fn decode_file_at(
+        &mut self,
+        idx: usize,
+        state: Option<&mut DecoderState>,
+    ) -> RarResult<Vec<u8>> {
+        let hdr = &self.entries[idx].header;
+
+        // Empty files / directories
+        if hdr.packed_size == 0 && hdr.unpacked_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let stream = self.stream.as_mut().unwrap();
         stream.seek(SeekFrom::Start(hdr.data_offset))?;
         let mut packed_data = vec![0u8; hdr.packed_size as usize];
         stream.read_exact(&mut packed_data)?;
@@ -301,7 +419,7 @@ impl RarArchive {
                 hdr.comp_method,
                 hdr.unpacked_size,
                 hdr.comp_dict_size,
-                None,
+                state,
             )
             .map_err(|e| RarError::Unsupported(e))?
         };
