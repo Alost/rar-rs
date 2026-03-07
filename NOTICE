@@ -24,10 +24,6 @@ Scope and Limitations
 
 This software:
 
-  - Does NOT support encrypted archive creation. Encrypted archive reading
-    supports both file-level AES-256 encryption and archive-level encryption
-    (encrypted headers).
-
   - Does NOT supersede, replace, or replicate the full capabilities of the
     native RAR archiver produced by RARLAB (Alexander Roshal). The proprietary
     RAR encoder uses advanced techniques (including optimal parsing, context

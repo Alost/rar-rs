@@ -19,6 +19,7 @@ archives with native LZSS+Huffman compression — no external binaries required.
 | Directory entries                    |   done |
 | Timestamp preservation               |   done |
 | Solid archive decompression          |   done |
+| File-level AES-256 encryption        |   done |
 | File-level AES-256 decryption        |   done |
 | Header-encrypted archive decryption  |   done |
 | Multi-volume archives                |   todo |
@@ -32,7 +33,7 @@ Archives produced by rar-rs are fully interoperable with WinRAR and unrar.
 ### rar
 
 ```
-rar a [-m0..-m5] archive.rar files...   Create archive
+rar a [-m0..-m5] [-p<password>] archive.rar files...   Create archive
 rar l archive.rar                       List contents
 rar i archive.rar                       Show info
 ```
@@ -67,6 +68,11 @@ rar.extract_all("/tmp/output/")?;
 // Read a single file
 let mut rar = RarArchive::open("backup.rar")?;
 let data = rar.read("notes.txt")?;
+
+// Create an encrypted archive
+let mut rar = RarArchive::create_with_password("secret.rar", "mypassword")?;
+rar.add("classified.txt", 3)?;
+rar.close()?;
 
 // Open an encrypted archive
 let mut rar = RarArchive::open_with_password("secret.rar", "mypassword")?;

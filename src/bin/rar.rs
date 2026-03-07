@@ -36,13 +36,14 @@ fn usage() {
     eprintln!("rar-rs — create RAR5 archives");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  rar a [-m0..-m5] <archive.rar> <files...>   Create archive");
-    eprintln!("  rar l <archive.rar>              List archive contents");
-    eprintln!("  rar i <archive.rar>              Show archive info");
+    eprintln!("  rar a [-m0..-m5] [-p<password>] <archive.rar> <files...>   Create archive");
+    eprintln!("  rar l [-p<password>] <archive.rar>              List archive contents");
+    eprintln!("  rar i [-p<password>] <archive.rar>              Show archive info");
 }
 
 fn cmd_create(args: &[String]) -> Result<(), String> {
     let mut level: u8 = 3;
+    let mut password: Option<String> = None;
     let mut positional = Vec::new();
 
     for arg in args {
@@ -53,19 +54,25 @@ fn cmd_create(args: &[String]) -> Result<(), String> {
             if level > 5 {
                 return Err(format!("compression level must be 0-5, got {level}"));
             }
+        } else if let Some(pw) = arg.strip_prefix("-p") {
+            password = Some(pw.to_string());
         } else {
             positional.push(arg.as_str());
         }
     }
 
     if positional.len() < 2 {
-        return Err("usage: rar a [-m0..-m5] <archive.rar> <files...>".into());
+        return Err("usage: rar a [-m0..-m5] [-p<password>] <archive.rar> <files...>".into());
     }
     let archive_path = positional[0];
     let files = &positional[1..];
 
-    let mut rar =
-        rar5::RarArchive::create(archive_path).map_err(|e| format!("create: {e}"))?;
+    let mut rar = if let Some(ref pw) = password {
+        rar5::RarArchive::create_with_password(archive_path, pw)
+            .map_err(|e| format!("create: {e}"))?
+    } else {
+        rar5::RarArchive::create(archive_path).map_err(|e| format!("create: {e}"))?
+    };
 
     for file in files {
         rar.add(file, level).map_err(|e| format!("add {file}: {e}"))?;

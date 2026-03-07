@@ -125,6 +125,13 @@ impl RarArchive {
         Ok(archive)
     }
 
+    /// Create a new encrypted RAR5 archive (overwrites existing file).
+    pub fn create_with_password(path: impl AsRef<Path>, password: &str) -> RarResult<Self> {
+        let mut archive = Self::create(path)?;
+        archive.password = Some(password.to_string());
+        Ok(archive)
+    }
+
     // ── Lifecycle ──────────────────────────────────────────────────────────
 
     fn open_read(&mut self) -> RarResult<()> {
@@ -666,7 +673,7 @@ impl RarArchive {
         };
 
         let method = level_to_method(level);
-        let (packed_data, actual_method, dict_size_log) = if method == COMP_METHOD_STORE {
+        let (mut packed_data, actual_method, dict_size_log) = if method == COMP_METHOD_STORE {
             (raw_data.clone(), COMP_METHOD_STORE, 0u8)
         } else {
             let dsl = dict_size_for_data(raw_data.len());
@@ -700,6 +707,17 @@ impl RarArchive {
         #[cfg(not(unix))]
         let attrs = 0o100644u64;
 
+        // Encrypt if password is set
+        let extra_data = if let Some(ref password) = self.password {
+            let enc_params = encryption::EncryptionParams::generate_for_password(
+                password, ENCR_PBKDF2_ITER_LOG,
+            );
+            packed_data = enc_params.encrypt(&packed_data, password);
+            enc_params.to_extra_bytes()
+        } else {
+            Vec::new()
+        };
+
         let fh = FileHeader {
             name: name.clone(),
             unpacked_size: raw_data.len() as u64,
@@ -711,6 +729,7 @@ impl RarArchive {
             comp_dict_size: dict_size_log,
             host_os: OS_UNIX,
             file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
+            extra_data,
             ..Default::default()
         };
 
@@ -809,7 +828,7 @@ impl RarArchive {
             .unwrap_or_default()
             .as_secs() as u32;
 
-        let (packed_data, actual_method, dict_size_log) = if method == COMP_METHOD_STORE {
+        let (mut packed_data, actual_method, dict_size_log) = if method == COMP_METHOD_STORE {
             (data.to_vec(), COMP_METHOD_STORE, 0u8)
         } else {
             let dsl = dict_size_for_data(data.len());
@@ -820,6 +839,17 @@ impl RarArchive {
             } else {
                 (compressed, method, dsl)
             }
+        };
+
+        // Encrypt if password is set
+        let extra_data = if let Some(ref password) = self.password {
+            let enc_params = encryption::EncryptionParams::generate_for_password(
+                password, ENCR_PBKDF2_ITER_LOG,
+            );
+            packed_data = enc_params.encrypt(&packed_data, password);
+            enc_params.to_extra_bytes()
+        } else {
+            Vec::new()
         };
 
         let name = arcname.replace('\\', "/");
@@ -834,6 +864,7 @@ impl RarArchive {
             comp_dict_size: dict_size_log,
             host_os: OS_UNIX,
             file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
+            extra_data,
             ..Default::default()
         };
 
@@ -865,4 +896,79 @@ fn dict_size_for_data(data_size: usize) -> u8 {
         log += 1;
     }
     log
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_store_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("rar");
+        let data = b"Hello, encrypted world!";
+        {
+            let mut ar = RarArchive::create_with_password(&path, "secret").unwrap();
+            ar.add_bytes("test.txt", data, 0).unwrap();
+            ar.close().unwrap();
+        }
+        {
+            let mut ar = RarArchive::open_with_password(&path, "secret").unwrap();
+            assert_eq!(ar.read("test.txt").unwrap(), data);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn encrypted_compressed_roundtrip() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("rar");
+        let data = b"Compress me! ".repeat(200);
+        {
+            let mut ar = RarArchive::create_with_password(&path, "pw").unwrap();
+            ar.add_bytes("test.txt", &data, 3).unwrap();
+            ar.close().unwrap();
+        }
+        {
+            let mut ar = RarArchive::open_with_password(&path, "pw").unwrap();
+            assert_eq!(ar.read("test.txt").unwrap(), data);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn encrypted_wrong_password_fails() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("rar");
+        {
+            let mut ar = RarArchive::create_with_password(&path, "right").unwrap();
+            ar.add_bytes("test.txt", b"data", 0).unwrap();
+            ar.close().unwrap();
+        }
+        {
+            let mut ar = RarArchive::open_with_password(&path, "wrong").unwrap();
+            assert!(ar.read("test.txt").is_err());
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn encrypted_multiple_files() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().with_extension("rar");
+        {
+            let mut ar = RarArchive::create_with_password(&path, "multi").unwrap();
+            ar.add_bytes("a.txt", b"First", 0).unwrap();
+            ar.add_bytes("b.txt", &b"Second ".repeat(50), 3).unwrap();
+            ar.add_bytes("c.bin", &(0..=255u8).collect::<Vec<_>>(), 0).unwrap();
+            ar.close().unwrap();
+        }
+        {
+            let mut ar = RarArchive::open_with_password(&path, "multi").unwrap();
+            assert_eq!(ar.read("a.txt").unwrap(), b"First");
+            assert_eq!(ar.read("b.txt").unwrap(), b"Second ".repeat(50));
+            assert_eq!(ar.read("c.bin").unwrap(), (0..=255u8).collect::<Vec<_>>());
+        }
+        std::fs::remove_file(&path).ok();
+    }
 }

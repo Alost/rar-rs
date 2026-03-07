@@ -174,6 +174,82 @@ impl EncryptionParams {
         let key = self.get_key(password);
         encrypt_data(plaintext, &key, &self.iv)
     }
+
+    /// Generate random encryption parameters with a password verification checksum.
+    ///
+    /// Each file gets a unique random salt and IV. The 12-byte checksum
+    /// consists of an 8-byte XOR-folded PswCheck plus a 4-byte CRC32 of
+    /// the raw PBKDF2 output, matching the native RAR5 format.
+    pub fn generate_for_password(password: &str, strength: u8) -> Self {
+        use rand::Rng;
+        let mut rng = rand::rng();
+
+        let mut salt = [0u8; ENCR_SALT_SIZE];
+        let mut iv = [0u8; ENCR_IV_SIZE];
+        rng.fill(&mut salt);
+        rng.fill(&mut iv);
+
+        let iterations = 1u32 << strength;
+
+        // Derive PswCheckValue: PBKDF2 with (iterations + 32)
+        let mut psw_check_value = [0u8; 32];
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+            password.as_bytes(),
+            &salt,
+            iterations + 32,
+            &mut psw_check_value,
+        );
+
+        // XOR-fold four 8-byte blocks → 8-byte PswCheck
+        let mut psw_check = [0u8; 8];
+        for i in 0..4 {
+            for j in 0..8 {
+                psw_check[j] ^= psw_check_value[i * 8 + j];
+            }
+        }
+
+        // 4-byte CRC32 of the raw 32-byte PBKDF2 output
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&psw_check_value);
+        let check_crc = hasher.finalize();
+
+        let mut checksum = [0u8; 12];
+        checksum[..8].copy_from_slice(&psw_check);
+        checksum[8..12].copy_from_slice(&check_crc.to_le_bytes());
+
+        EncryptionParams {
+            version: ENCR_VERSION_AES256,
+            flags: 0x01,
+            strength,
+            salt,
+            iv,
+            checksum: Some(checksum),
+            iterations,
+        }
+    }
+
+    /// Serialize to the RAR5 extra-area encryption record binary format.
+    ///
+    /// Format: `[record_size vint] [record_type vint] [body bytes]`
+    pub fn to_extra_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(vint::encode(ENCR_VERSION_AES256 as u64));
+        body.extend(vint::encode(self.flags as u64));
+        body.push(self.strength);
+        body.extend_from_slice(&self.salt);
+        body.extend_from_slice(&self.iv);
+        if let Some(ref ck) = self.checksum {
+            body.extend_from_slice(ck);
+        }
+
+        let type_bytes = vint::encode(EXTRA_FILE_ENCRYPTION);
+        let rec_size = type_bytes.len() + body.len();
+        let mut out = Vec::new();
+        out.extend(vint::encode(rec_size as u64));
+        out.extend(type_bytes);
+        out.extend(body);
+        out
+    }
 }
 
 /// Parse the archive-level encryption header block (type 0x04).
