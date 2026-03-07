@@ -36,14 +36,33 @@ fn usage() {
     eprintln!("rar-rs — create RAR5 archives");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  rar a [-m0..-m5] [-p<password>] <archive.rar> <files...>   Create archive");
+    eprintln!("  rar a [-m0..-m5] [-p<password>] [-v<size>] <archive.rar> <files...>");
     eprintln!("  rar l [-p<password>] <archive.rar>              List archive contents");
     eprintln!("  rar i [-p<password>] <archive.rar>              Show archive info");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -v<size>    Create multi-volume archive (e.g. -v1m, -v100k, -v50000)");
+}
+
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix('k').or_else(|| s.strip_suffix('K')) {
+        num.parse::<u64>()
+            .map(|n| n * 1024)
+            .map_err(|_| format!("invalid size: {s}"))
+    } else if let Some(num) = s.strip_suffix('m').or_else(|| s.strip_suffix('M')) {
+        num.parse::<u64>()
+            .map(|n| n * 1024 * 1024)
+            .map_err(|_| format!("invalid size: {s}"))
+    } else {
+        s.parse::<u64>().map_err(|_| format!("invalid size: {s}"))
+    }
 }
 
 fn cmd_create(args: &[String]) -> Result<(), String> {
     let mut level: u8 = 3;
     let mut password: Option<String> = None;
+    let mut volume_size: Option<u64> = None;
     let mut positional = Vec::new();
 
     for arg in args {
@@ -56,18 +75,27 @@ fn cmd_create(args: &[String]) -> Result<(), String> {
             }
         } else if let Some(pw) = arg.strip_prefix("-p") {
             password = Some(pw.to_string());
+        } else if let Some(sz) = arg.strip_prefix("-v") {
+            volume_size = Some(parse_size(sz)?);
         } else {
             positional.push(arg.as_str());
         }
     }
 
     if positional.len() < 2 {
-        return Err("usage: rar a [-m0..-m5] [-p<password>] <archive.rar> <files...>".into());
+        return Err("usage: rar a [-m0..-m5] [-p<password>] [-v<size>] <archive.rar> <files...>".into());
     }
     let archive_path = positional[0];
     let files = &positional[1..];
 
-    let mut rar = if let Some(ref pw) = password {
+    let mut rar = if let Some(vol_size) = volume_size {
+        let mut ar = rar5::RarArchive::create_multivolume(archive_path, vol_size)
+            .map_err(|e| format!("create: {e}"))?;
+        if let Some(ref pw) = password {
+            ar.set_password(pw);
+        }
+        ar
+    } else if let Some(ref pw) = password {
         rar5::RarArchive::create_with_password(archive_path, pw)
             .map_err(|e| format!("create: {e}"))?
     } else {
@@ -79,7 +107,12 @@ fn cmd_create(args: &[String]) -> Result<(), String> {
     }
 
     rar.close().map_err(|e| format!("close: {e}"))?;
-    println!("Created {archive_path} ({} file(s), level {level})", files.len());
+    if volume_size.is_some() {
+        let vols = rar5::discover_volumes(std::path::Path::new(archive_path));
+        println!("Created {} volume(s) ({} file(s), level {level})", vols.len(), files.len());
+    } else {
+        println!("Created {archive_path} ({} file(s), level {level})", files.len());
+    }
     Ok(())
 }
 

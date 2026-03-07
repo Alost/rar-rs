@@ -32,7 +32,8 @@ pub mod error;
 pub mod headers;
 pub mod vint;
 
-pub use archive::{ArchiveEntry, RarArchive};
+pub use archive::{discover_volumes, ArchiveEntry, RarArchive};
 pub use constants::*;
 pub use encryption::EncryptionParams;
 pub use error::{RarError, RarResult};
+pub use headers::DataChunk;

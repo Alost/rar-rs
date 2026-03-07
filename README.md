@@ -22,7 +22,8 @@ archives with native LZSS+Huffman compression — no external binaries required.
 | File-level AES-256 encryption        |   done |
 | File-level AES-256 decryption        |   done |
 | Header-encrypted archive decryption  |   done |
-| Multi-volume archives                |   todo |
+| Multi-volume archive reading         |   done |
+| Multi-volume archive creation        |   done |
 
 Archives produced by rar-rs are fully interoperable with WinRAR and unrar.
 
@@ -33,10 +34,12 @@ Archives produced by rar-rs are fully interoperable with WinRAR and unrar.
 ### rar
 
 ```
-rar a [-m0..-m5] [-p<password>] archive.rar files...   Create archive
-rar l archive.rar                       List contents
-rar i archive.rar                       Show info
+rar a [-m0..-m5] [-p<password>] [-v<size>] archive.rar files...   Create archive
+rar l archive.rar                          List contents
+rar i archive.rar                          Show info
 ```
+
+The `-v` flag creates multi-volume archives (e.g. `-v1m` for 1 MB volumes, `-v100k` for 100 KB).
 
 ### unrar
 
@@ -77,6 +80,15 @@ rar.close()?;
 // Open an encrypted archive
 let mut rar = RarArchive::open_with_password("secret.rar", "mypassword")?;
 let data = rar.read("classified.txt")?;
+
+// Create a multi-volume archive (1 MB per volume)
+let mut rar = RarArchive::create_multivolume("backup.rar", 1048576)?;
+rar.add("large_file.bin", 3)?;
+rar.close()?;
+
+// Open a multi-volume archive (auto-discovers all volumes)
+let mut rar = RarArchive::open("backup.part1.rar")?;
+rar.extract_all("/tmp/output/")?;
 ```
 
 ---

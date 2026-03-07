@@ -115,6 +115,7 @@ impl RawBlock {
 pub struct ArchiveHeader {
     pub flags: u64,
     pub extra_data: Vec<u8>,
+    pub volume_number: Option<u64>,
 }
 
 impl ArchiveHeader {
@@ -123,16 +124,29 @@ impl ArchiveHeader {
         let mut body = Vec::new();
         body.extend(vint::encode(BLOCK_TYPE_ARCHIVE_HEADER));
 
-        let mut eff_flags = 0u64;
+        // Block-level flags (not archive-level flags)
+        let mut block_flags = 0u64;
         if !self.extra_data.is_empty() {
-            eff_flags |= BLOCK_FLAG_EXTRA_DATA;
+            block_flags |= BLOCK_FLAG_EXTRA_DATA;
         }
-        body.extend(vint::encode(eff_flags));
+        body.extend(vint::encode(block_flags));
 
         if !self.extra_data.is_empty() {
             body.extend(vint::encode(self.extra_data.len() as u64));
         }
-        body.extend(vint::encode(self.flags & 0xFFFF));
+
+        // Archive-level flags
+        let mut arch_flags = self.flags & 0xFFFF;
+        if self.volume_number.is_some() {
+            arch_flags |= ARCHIVE_FLAG_VOLUME | ARCHIVE_FLAG_VOLUME_NUM;
+        }
+        body.extend(vint::encode(arch_flags));
+
+        // Volume number follows arch_flags when VOLUME_NUM is set
+        if let Some(vol_num) = self.volume_number {
+            body.extend(vint::encode(vol_num));
+        }
+
         body.extend(&self.extra_data);
 
         let size_bytes = vint::encode(body.len() as u64);
@@ -174,6 +188,16 @@ impl ArchiveHeader {
             vint::decode_from_slice(data, offset).map_err(|e| RarError::Format(e.to_string()))?;
         offset += n;
 
+        // Volume number follows arch_flags when ARCHIVE_FLAG_VOLUME_NUM is set
+        let volume_number = if arch_flags & ARCHIVE_FLAG_VOLUME_NUM != 0 {
+            let (v, n) = vint::decode_from_slice(data, offset)
+                .map_err(|e| RarError::Format(e.to_string()))?;
+            offset += n;
+            Some(v)
+        } else {
+            None
+        };
+
         let extra_data = if extra_size > 0 && offset < data.len() {
             let end = (offset + extra_size as usize).min(data.len());
             data[offset..end].to_vec()
@@ -184,8 +208,24 @@ impl ArchiveHeader {
         Ok(ArchiveHeader {
             flags: arch_flags,
             extra_data,
+            volume_number,
         })
     }
+}
+
+// ── Data Chunk ─────────────────────────────────────────────────────────────
+
+/// Describes a contiguous slice of packed file data within one volume.
+///
+/// Multi-volume archives split a file's packed data across multiple volumes.
+#[derive(Clone, Debug)]
+pub struct DataChunk {
+    pub volume_index: usize,
+    pub data_offset: u64,
+    pub packed_size: u64,
+    pub crc32_val: Option<u32>,
+    pub is_final: bool,
+    pub extra_data: Vec<u8>,
 }
 
 // ── File Header ────────────────────────────────────────────────────────────

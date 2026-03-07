@@ -20,6 +20,7 @@ use crate::vint;
 #[derive(Clone, Debug)]
 pub struct ArchiveEntry {
     pub header: FileHeader,
+    pub chunks: Vec<DataChunk>,
 }
 
 impl ArchiveEntry {
@@ -60,6 +61,14 @@ pub struct RarArchive {
     solid_decoded_through: isize,
     /// Password for encrypted archives.
     password: Option<String>,
+    /// All volume file paths (multi-volume archives).
+    volume_paths: Vec<PathBuf>,
+    /// Volume size limit for multi-volume creation (None = single volume).
+    volume_size: Option<u64>,
+    /// Current volume number during creation (1-indexed).
+    current_volume: usize,
+    /// Bytes written in the current volume during creation.
+    volume_bytes_written: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -83,6 +92,10 @@ impl RarArchive {
             solid_state: None,
             solid_decoded_through: -1,
             password: None,
+            volume_paths: Vec::new(),
+            volume_size: None,
+            current_volume: 0,
+            volume_bytes_written: 0,
         };
         archive.open_read()?;
         Ok(archive)
@@ -99,6 +112,10 @@ impl RarArchive {
             solid_state: None,
             solid_decoded_through: -1,
             password: Some(password.to_string()),
+            volume_paths: Vec::new(),
+            volume_size: None,
+            current_volume: 0,
+            volume_bytes_written: 0,
         };
         archive.open_read()?;
         Ok(archive)
@@ -120,8 +137,38 @@ impl RarArchive {
             solid_state: None,
             solid_decoded_through: -1,
             password: None,
+            volume_paths: Vec::new(),
+            volume_size: None,
+            current_volume: 0,
+            volume_bytes_written: 0,
         };
         archive.open_write()?;
+        Ok(archive)
+    }
+
+    /// Create a new multi-volume RAR5 archive.
+    pub fn create_multivolume(path: impl AsRef<Path>, volume_size: u64) -> RarResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let volume_base = get_volume_base(&path);
+        let vol_path = volume_path(path.parent().unwrap_or(Path::new(".")), &volume_base, 1);
+        let mut archive = RarArchive {
+            path,
+            mode: Mode::Write,
+            entries: Vec::new(),
+            stream: None,
+            solid_state: None,
+            solid_decoded_through: -1,
+            password: None,
+            volume_paths: vec![vol_path.clone()],
+            volume_size: Some(volume_size),
+            current_volume: 1,
+            volume_bytes_written: 0,
+        };
+        let f = File::create(&vol_path)?;
+        archive.stream = Some(f);
+        archive.write_signature()?;
+        archive.write_archive_header_vol(None)?;
+        archive.volume_bytes_written = archive.stream.as_ref().unwrap().stream_position()?;
         Ok(archive)
     }
 
@@ -135,10 +182,15 @@ impl RarArchive {
     // ── Lifecycle ──────────────────────────────────────────────────────────
 
     fn open_read(&mut self) -> RarResult<()> {
-        let f = File::open(&self.path)?;
-        self.stream = Some(f);
-        self.verify_signature()?;
-        self.scan_blocks()?;
+        self.volume_paths = discover_volumes(&self.path);
+        if self.volume_paths.len() > 1 {
+            self.scan_all_volumes()?;
+        } else {
+            let f = File::open(&self.path)?;
+            self.stream = Some(f);
+            self.verify_signature()?;
+            self.scan_blocks()?;
+        }
         Ok(())
     }
 
@@ -211,7 +263,18 @@ impl RarArchive {
                 }
                 BLOCK_TYPE_FILE_HEADER => {
                     let fh = FileHeader::from_raw(&raw, stream_pos)?;
-                    self.entries.push(ArchiveEntry { header: fh });
+                    let chunk = DataChunk {
+                        volume_index: 0,
+                        data_offset: fh.data_offset,
+                        packed_size: fh.packed_size,
+                        crc32_val: fh.crc32_val,
+                        is_final: true,
+                        extra_data: fh.extra_data.clone(),
+                    };
+                    self.entries.push(ArchiveEntry {
+                        header: fh,
+                        chunks: vec![chunk],
+                    });
                 }
                 BLOCK_TYPE_END_ARCHIVE => break,
                 BLOCK_TYPE_ENCRYPT_HEADER => {
@@ -345,7 +408,18 @@ impl RarArchive {
                 }
                 BLOCK_TYPE_FILE_HEADER => {
                     let fh = FileHeader::from_raw(&raw, raw.data_offset)?;
-                    self.entries.push(ArchiveEntry { header: fh });
+                    let chunk = DataChunk {
+                        volume_index: 0,
+                        data_offset: fh.data_offset,
+                        packed_size: fh.packed_size,
+                        crc32_val: fh.crc32_val,
+                        is_final: true,
+                        extra_data: fh.extra_data.clone(),
+                    };
+                    self.entries.push(ArchiveEntry {
+                        header: fh,
+                        chunks: vec![chunk],
+                    });
                 }
                 BLOCK_TYPE_END_ARCHIVE => break,
                 _ => {}
@@ -360,12 +434,120 @@ impl RarArchive {
         Ok(())
     }
 
+    /// Scan all volumes of a multi-volume archive.
+    fn scan_all_volumes(&mut self) -> RarResult<()> {
+        self.entries.clear();
+        let mut pending: Option<ArchiveEntry> = None;
+
+        for (vol_idx, vol_path) in self.volume_paths.iter().enumerate() {
+            let mut stream = File::open(vol_path)?;
+
+            // Verify signature
+            let mut sig = [0u8; 8];
+            stream.read_exact(&mut sig)?;
+            if sig != *RAR5_SIGNATURE {
+                return Err(RarError::Format(format!(
+                    "volume {} has bad signature",
+                    vol_path.display()
+                )));
+            }
+
+            loop {
+                let raw = match RawBlock::read_from(&mut stream) {
+                    Ok(b) => b,
+                    Err(RarError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                };
+
+                let stream_pos = stream.stream_position()?;
+
+                match raw.block_type {
+                    BLOCK_TYPE_ARCHIVE_HEADER => {
+                        let _ah = ArchiveHeader::from_raw(&raw)?;
+                    }
+                    BLOCK_TYPE_FILE_HEADER => {
+                        let fh = FileHeader::from_raw(&raw, stream_pos)?;
+                        let continues_from = raw.flags & BLOCK_FLAG_DATA_CONTINUES != 0;
+                        let continues_to = raw.flags & BLOCK_FLAG_DATA_CONTINUE_TO != 0;
+
+                        let chunk = DataChunk {
+                            volume_index: vol_idx,
+                            data_offset: fh.data_offset,
+                            packed_size: fh.packed_size,
+                            crc32_val: fh.crc32_val,
+                            is_final: !continues_to,
+                            extra_data: fh.extra_data.clone(),
+                        };
+
+                        if continues_from {
+                            if let Some(ref mut entry) = pending {
+                                entry.chunks.push(chunk);
+                                if !continues_to {
+                                    // Final chunk
+                                    let total_packed: u64 =
+                                        entry.chunks.iter().map(|c| c.packed_size).sum();
+                                    entry.header.packed_size = total_packed;
+                                    entry.header.crc32_val = fh.crc32_val;
+                                    self.entries.push(pending.take().unwrap());
+                                }
+                            }
+                        } else if continues_to {
+                            pending = Some(ArchiveEntry {
+                                header: fh,
+                                chunks: vec![chunk],
+                            });
+                        } else {
+                            self.entries.push(ArchiveEntry {
+                                header: fh,
+                                chunks: vec![chunk],
+                            });
+                        }
+                    }
+                    BLOCK_TYPE_END_ARCHIVE => {
+                        let eoa = EndOfArchiveHeader::from_raw(&raw)?;
+                        if eoa.flags & END_FLAG_NEXT_VOLUME == 0 {
+                            break;
+                        } else {
+                            break; // continue to next volume
+                        }
+                    }
+                    BLOCK_TYPE_ENCRYPT_HEADER => {
+                        return Err(RarError::Unsupported(
+                            "header-encrypted multi-volume archives not yet supported".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+
+                if raw.data_size > 0 {
+                    stream.seek(SeekFrom::Start(raw.data_offset + raw.data_size))?;
+                }
+            }
+        }
+
+        // Keep the first volume open as the default stream
+        self.stream = Some(File::open(&self.volume_paths[0])?);
+        Ok(())
+    }
+
     // ── Writing ────────────────────────────────────────────────────────────
 
     fn write_archive_header(&mut self) -> RarResult<()> {
         let hdr = ArchiveHeader {
             flags: 0,
             extra_data: Vec::new(),
+            volume_number: None,
+        };
+        let stream = self.stream.as_mut().unwrap();
+        stream.write_all(&hdr.to_bytes())?;
+        Ok(())
+    }
+
+    fn write_archive_header_vol(&mut self, volume_number: Option<u64>) -> RarResult<()> {
+        let hdr = ArchiveHeader {
+            flags: ARCHIVE_FLAG_VOLUME,
+            extra_data: Vec::new(),
+            volume_number,
         };
         let stream = self.stream.as_mut().unwrap();
         stream.write_all(&hdr.to_bytes())?;
@@ -373,9 +555,33 @@ impl RarArchive {
     }
 
     fn write_end_block(&mut self) -> RarResult<()> {
-        let eoa = EndOfArchiveHeader { flags: 0 };
+        self.write_end_block_flags(false)
+    }
+
+    fn write_end_block_flags(&mut self, next_volume: bool) -> RarResult<()> {
+        let flags = if next_volume { END_FLAG_NEXT_VOLUME } else { 0 };
+        let eoa = EndOfArchiveHeader { flags };
         let stream = self.stream.as_mut().unwrap();
         stream.write_all(&eoa.to_bytes())?;
+        Ok(())
+    }
+
+    fn start_next_volume(&mut self) -> RarResult<()> {
+        self.write_end_block_flags(true)?;
+        // Close current volume
+        self.stream = None;
+        self.current_volume += 1;
+        let parent = self.path.parent().unwrap_or(Path::new("."));
+        let base = get_volume_base(&self.path);
+        let vol_path = volume_path(parent, &base, self.current_volume);
+        self.volume_paths.push(vol_path.clone());
+        let f = File::create(&vol_path)?;
+        self.stream = Some(f);
+        self.write_signature()?;
+        // Volume number: part2 → 1, part3 → 2, etc.
+        let vol_num = (self.current_volume - 1) as u64;
+        self.write_archive_header_vol(Some(vol_num))?;
+        self.volume_bytes_written = self.stream.as_ref().unwrap().stream_position()?;
         Ok(())
     }
 
@@ -557,6 +763,118 @@ impl RarArchive {
         Ok(target_data)
     }
 
+    /// Read packed data for an entry, potentially across multiple volumes.
+    fn read_packed_data(&mut self, idx: usize) -> RarResult<(Vec<u8>, bool)> {
+        let entry = &self.entries[idx];
+        let hdr = &entry.header;
+        let chunks = &entry.chunks;
+
+        if chunks.len() <= 1 {
+            // Single chunk — read from primary stream or the chunk's volume
+            let chunk = chunks.first();
+            let (offset, size) = if let Some(c) = chunk {
+                (c.data_offset, c.packed_size)
+            } else {
+                (hdr.data_offset, hdr.packed_size)
+            };
+
+            let vol_idx = chunk.map_or(0, |c| c.volume_index);
+            let packed_data = if vol_idx == 0 {
+                let stream = self.stream.as_mut().unwrap();
+                stream.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; size as usize];
+                stream.read_exact(&mut buf)?;
+                buf
+            } else {
+                let mut f = File::open(&self.volume_paths[vol_idx])?;
+                f.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; size as usize];
+                f.read_exact(&mut buf)?;
+                buf
+            };
+
+            // Decrypt if encrypted
+            let encr_params = if !hdr.extra_data.is_empty() {
+                encryption::parse_encryption_extra(&hdr.extra_data)?
+            } else {
+                None
+            };
+            let is_encrypted = encr_params.is_some();
+            let mut packed_data = packed_data;
+            if let Some(ref params) = encr_params {
+                let password = self.password.as_ref().ok_or_else(|| {
+                    RarError::Encrypted(format!("{}: encrypted, no password set", hdr.name))
+                })?;
+                if !params.verify_password(password) {
+                    return Err(RarError::Encrypted("wrong password".into()));
+                }
+                packed_data = params.decrypt(&packed_data, password)?;
+            }
+            if is_encrypted && hdr.comp_method == COMP_METHOD_STORE {
+                packed_data.truncate(hdr.unpacked_size as usize);
+            }
+            return Ok((packed_data, is_encrypted));
+        }
+
+        // Multi-volume: read and concatenate chunks
+        let chunks_clone: Vec<DataChunk> = chunks.clone();
+        let mut parts = Vec::new();
+        for chunk in &chunks_clone {
+            let mut f = File::open(&self.volume_paths[chunk.volume_index])?;
+            f.seek(SeekFrom::Start(chunk.data_offset))?;
+            let mut buf = vec![0u8; chunk.packed_size as usize];
+            f.read_exact(&mut buf)?;
+
+            // Verify intermediate chunk CRC (packed data CRC)
+            if !chunk.is_final {
+                if let Some(expected_crc) = chunk.crc32_val {
+                    let mut hasher = crc32fast::Hasher::new();
+                    hasher.update(&buf);
+                    let actual_crc = hasher.finalize();
+                    if actual_crc != expected_crc {
+                        return Err(RarError::Crc {
+                            expected: expected_crc,
+                            actual: actual_crc,
+                            context: format!(
+                                "{} vol {}",
+                                hdr.name, chunk.volume_index
+                            ),
+                        });
+                    }
+                }
+            }
+            parts.push(buf);
+        }
+
+        let packed_data: Vec<u8> = parts.into_iter().flatten().collect();
+
+        // Handle encryption for multi-volume
+        let encr_params = if !self.entries[idx].header.extra_data.is_empty() {
+            encryption::parse_encryption_extra(&self.entries[idx].header.extra_data)?
+        } else {
+            None
+        };
+        let is_encrypted = encr_params.is_some();
+        let mut packed_data = packed_data;
+        if let Some(ref params) = encr_params {
+            let password = self.password.as_ref().ok_or_else(|| {
+                RarError::Encrypted(format!(
+                    "{}: encrypted, no password set",
+                    self.entries[idx].header.name
+                ))
+            })?;
+            if !params.verify_password(password) {
+                return Err(RarError::Encrypted("wrong password".into()));
+            }
+            packed_data = params.decrypt(&packed_data, password)?;
+        }
+        if is_encrypted && self.entries[idx].header.comp_method == COMP_METHOD_STORE {
+            packed_data.truncate(self.entries[idx].header.unpacked_size as usize);
+        }
+
+        Ok((packed_data, is_encrypted))
+    }
+
     /// Decode a single file, optionally with a shared DecoderState.
     fn decode_file_at(
         &mut self,
@@ -570,41 +888,10 @@ impl RarArchive {
             return Ok(Vec::new());
         }
 
-        // Check for encryption in extra area
-        let encr_params = if !hdr.extra_data.is_empty() {
-            encryption::parse_encryption_extra(&hdr.extra_data)?
-        } else {
-            None
-        };
-
-        let is_encrypted = encr_params.is_some();
-
-        if is_encrypted && self.password.is_none() {
-            return Err(RarError::Encrypted(format!(
-                "{}: encrypted, no password set",
-                hdr.name
-            )));
-        }
-
-        let stream = self.stream.as_mut().unwrap();
-        stream.seek(SeekFrom::Start(hdr.data_offset))?;
-        let mut packed_data = vec![0u8; hdr.packed_size as usize];
-        stream.read_exact(&mut packed_data)?;
-
-        // Decrypt if encrypted
-        if let Some(ref params) = encr_params {
-            let password = self.password.as_ref().unwrap();
-            if !params.verify_password(password) {
-                return Err(RarError::Encrypted("wrong password".into()));
-            }
-            packed_data = params.decrypt(&packed_data, password)?;
-        }
+        let (packed_data, is_encrypted) = self.read_packed_data(idx)?;
+        let hdr = &self.entries[idx].header;
 
         let raw_data = if hdr.comp_method == COMP_METHOD_STORE {
-            // For store mode, truncate to unpacked_size (strip zero-fill padding)
-            if is_encrypted {
-                packed_data.truncate(hdr.unpacked_size as usize);
-            }
             packed_data
         } else {
             compression::decompress(
@@ -619,7 +906,7 @@ impl RarArchive {
 
         // Verify CRC (skip for encrypted files — CRC is password-dependent)
         if !is_encrypted {
-            if let Some(expected_crc) = hdr.crc32_val {
+            if let Some(expected_crc) = self.entries[idx].header.crc32_val {
                 let mut hasher = crc32fast::Hasher::new();
                 hasher.update(&raw_data);
                 let actual_crc = hasher.finalize();
@@ -627,7 +914,7 @@ impl RarArchive {
                     return Err(RarError::Crc {
                         expected: expected_crc,
                         actual: actual_crc,
-                        context: hdr.name.clone(),
+                        context: self.entries[idx].header.name.clone(),
                     });
                 }
             }
@@ -718,33 +1005,17 @@ impl RarArchive {
             Vec::new()
         };
 
-        let fh = FileHeader {
-            name: name.clone(),
-            unpacked_size: raw_data.len() as u64,
-            packed_size: packed_data.len() as u64,
-            attributes: attrs,
+        self.write_file_entry(
+            &name,
+            raw_data.len() as u64,
+            &packed_data,
+            file_crc,
+            actual_method,
+            dict_size_log,
+            &extra_data,
+            attrs,
             mtime,
-            crc32_val: Some(file_crc),
-            comp_method: actual_method,
-            comp_dict_size: dict_size_log,
-            host_os: OS_UNIX,
-            file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
-            extra_data,
-            ..Default::default()
-        };
-
-        let stream = self.stream.as_mut().unwrap();
-        stream.write_all(&fh.to_bytes())?;
-        stream.write_all(&packed_data)?;
-
-        self.entries.push(ArchiveEntry {
-            header: FileHeader {
-                data_offset: stream.stream_position()? - packed_data.len() as u64,
-                ..fh
-            },
-        });
-
-        Ok(())
+        )
     }
 
     fn add_directory(
@@ -787,7 +1058,10 @@ impl RarArchive {
 
         let stream = self.stream.as_mut().unwrap();
         stream.write_all(&fh.to_bytes())?;
-        self.entries.push(ArchiveEntry { header: fh });
+        self.entries.push(ArchiveEntry {
+            header: fh,
+            chunks: Vec::new(),
+        });
 
         if recursive {
             let mut children: Vec<_> = fs::read_dir(path)?
@@ -853,30 +1127,224 @@ impl RarArchive {
         };
 
         let name = arcname.replace('\\', "/");
-        let fh = FileHeader {
-            name: name.clone(),
-            unpacked_size: data.len() as u64,
+        self.write_file_entry(
+            &name,
+            data.len() as u64,
+            &packed_data,
+            file_crc,
+            actual_method,
+            dict_size_log,
+            &extra_data,
+            0o100644,
+            mtime,
+        )
+    }
+
+    /// Write a file entry, splitting across volumes if needed.
+    fn write_file_entry(
+        &mut self,
+        name: &str,
+        unpacked_size: u64,
+        packed_data: &[u8],
+        file_crc: u32,
+        method: u8,
+        dict_size_log: u8,
+        extra_data: &[u8],
+        attrs: u64,
+        mtime: u32,
+    ) -> RarResult<()> {
+        let fh_base = FileHeader {
+            name: name.to_string(),
+            unpacked_size,
             packed_size: packed_data.len() as u64,
-            attributes: 0o100644,
+            attributes: attrs,
             mtime,
             crc32_val: Some(file_crc),
-            comp_method: actual_method,
+            comp_method: method,
             comp_dict_size: dict_size_log,
             host_os: OS_UNIX,
             file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
-            extra_data,
+            extra_data: extra_data.to_vec(),
             ..Default::default()
         };
 
-        let stream = self.stream.as_mut().unwrap();
-        stream.write_all(&fh.to_bytes())?;
-        stream.write_all(&packed_data)?;
+        if self.volume_size.is_none() {
+            // Single-volume
+            let hdr_bytes = fh_base.to_bytes();
+            let stream = self.stream.as_mut().unwrap();
+            stream.write_all(&hdr_bytes)?;
+            stream.write_all(packed_data)?;
+            let data_offset = stream.stream_position()? - packed_data.len() as u64;
+            let chunk = DataChunk {
+                volume_index: 0,
+                data_offset,
+                packed_size: packed_data.len() as u64,
+                crc32_val: Some(file_crc),
+                is_final: true,
+                extra_data: extra_data.to_vec(),
+            };
+            self.entries.push(ArchiveEntry {
+                header: FileHeader {
+                    data_offset,
+                    ..fh_base
+                },
+                chunks: vec![chunk],
+            });
+            return Ok(());
+        }
+
+        // Multi-volume splitting
+        let volume_size = self.volume_size.unwrap();
+        let eoa_size: u64 = 7; // approximate end-of-archive block size
+        let total_packed = packed_data.len() as u64;
+
+        // Check if it fits in current volume
+        let hdr_bytes = fh_base.to_bytes();
+        let total_needed = hdr_bytes.len() as u64 + total_packed + eoa_size;
+        let remaining = volume_size.saturating_sub(self.volume_bytes_written);
+
+        if total_needed <= remaining {
+            // Fits entirely
+            let stream = self.stream.as_mut().unwrap();
+            stream.write_all(&hdr_bytes)?;
+            stream.write_all(packed_data)?;
+            self.volume_bytes_written += hdr_bytes.len() as u64 + total_packed;
+            let data_offset = stream.stream_position()? - total_packed;
+            let chunk = DataChunk {
+                volume_index: self.current_volume - 1,
+                data_offset,
+                packed_size: total_packed,
+                crc32_val: Some(file_crc),
+                is_final: true,
+                extra_data: extra_data.to_vec(),
+            };
+            self.entries.push(ArchiveEntry {
+                header: FileHeader {
+                    data_offset,
+                    ..fh_base
+                },
+                chunks: vec![chunk],
+            });
+            return Ok(());
+        }
+
+        // Need to split across volumes
+        let mut offset = 0u64;
+        let mut chunks = Vec::new();
+        let mut is_first = true;
+
+        while offset < total_packed {
+            let remaining_vol = volume_size.saturating_sub(self.volume_bytes_written);
+
+            // Build chunk flags
+            let mut block_flags: u64 = 0;
+            if !is_first {
+                block_flags |= BLOCK_FLAG_DATA_CONTINUES;
+            }
+
+            // Estimate header size
+            let chunk_fh = FileHeader {
+                name: name.to_string(),
+                unpacked_size,
+                packed_size: remaining_vol.max(1),
+                attributes: attrs,
+                mtime,
+                crc32_val: Some(0),
+                comp_method: method,
+                comp_dict_size: dict_size_log,
+                host_os: OS_UNIX,
+                flags: block_flags | BLOCK_FLAG_DATA_CONTINUE_TO,
+                file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
+                extra_data: if is_first {
+                    extra_data.to_vec()
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+            let hdr_size = chunk_fh.to_bytes().len() as u64;
+
+            let bytes_for_data = remaining_vol.saturating_sub(hdr_size + eoa_size);
+            if bytes_for_data == 0 {
+                self.start_next_volume()?;
+                is_first = false;
+                continue;
+            }
+
+            let chunk_size = bytes_for_data.min(total_packed - offset);
+            let is_last = offset + chunk_size >= total_packed;
+            let chunk_packed =
+                &packed_data[offset as usize..(offset + chunk_size) as usize];
+
+            // Set final flags
+            if is_last {
+                block_flags &= !BLOCK_FLAG_DATA_CONTINUE_TO;
+            } else {
+                block_flags |= BLOCK_FLAG_DATA_CONTINUE_TO;
+            }
+
+            let chunk_crc = if is_last {
+                file_crc
+            } else {
+                let mut h = crc32fast::Hasher::new();
+                h.update(chunk_packed);
+                h.finalize()
+            };
+
+            let final_fh = FileHeader {
+                name: name.to_string(),
+                unpacked_size,
+                packed_size: chunk_size,
+                attributes: attrs,
+                mtime,
+                crc32_val: Some(chunk_crc),
+                comp_method: method,
+                comp_dict_size: dict_size_log,
+                host_os: OS_UNIX,
+                flags: block_flags,
+                file_flags: FILE_FLAG_TIME_UNIX | FILE_FLAG_CRC32,
+                extra_data: if is_first {
+                    extra_data.to_vec()
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            };
+
+            let final_hdr = final_fh.to_bytes();
+            let stream = self.stream.as_mut().unwrap();
+            stream.write_all(&final_hdr)?;
+            stream.write_all(chunk_packed)?;
+            self.volume_bytes_written += final_hdr.len() as u64 + chunk_size;
+
+            let data_offset = stream.stream_position()? - chunk_size;
+            chunks.push(DataChunk {
+                volume_index: self.current_volume - 1,
+                data_offset,
+                packed_size: chunk_size,
+                crc32_val: Some(chunk_crc),
+                is_final: is_last,
+                extra_data: if is_first {
+                    extra_data.to_vec()
+                } else {
+                    Vec::new()
+                },
+            });
+
+            offset += chunk_size;
+            is_first = false;
+
+            if !is_last {
+                self.start_next_volume()?;
+            }
+        }
 
         self.entries.push(ArchiveEntry {
             header: FileHeader {
-                data_offset: stream.stream_position()? - packed_data.len() as u64,
-                ..fh
+                packed_size: total_packed,
+                ..fh_base
             },
+            chunks,
         });
 
         Ok(())
@@ -896,6 +1364,84 @@ fn dict_size_for_data(data_size: usize) -> u8 {
         log += 1;
     }
     log
+}
+
+/// Discover all volumes of a multi-volume RAR5 archive.
+///
+/// Given any volume path, returns a sorted list of all volume paths
+/// starting from part1. Uses `.partN.rar` naming convention.
+pub fn discover_volumes(path: &Path) -> Vec<PathBuf> {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n.to_string(),
+        None => return vec![path.to_path_buf()],
+    };
+
+    // Match .partN.rar naming
+    if let Some(base) = extract_volume_base(&name) {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let mut volumes = Vec::new();
+        let mut n = 1;
+        loop {
+            let vol = parent.join(format!("{base}.part{n}.rar"));
+            if vol.exists() {
+                volumes.push(vol);
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        if !volumes.is_empty() {
+            return volumes;
+        }
+    }
+
+    // Check if path itself names a single-volume file that has a .part1.rar sibling
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let part1 = parent.join(format!("{stem}.part1.rar"));
+        if part1.exists() && part1 != path {
+            return discover_volumes(&part1);
+        }
+    }
+
+    vec![path.to_path_buf()]
+}
+
+/// Extract volume base from a filename like `archive.part3.rar` → `archive`.
+fn extract_volume_base(name: &str) -> Option<String> {
+    // Case-insensitive match for .partN.rar
+    let lower = name.to_lowercase();
+    if let Some(idx) = lower.find(".part") {
+        let after = &lower[idx + 5..];
+        if let Some(rar_idx) = after.find(".rar") {
+            let num_str = &after[..rar_idx];
+            if num_str.chars().all(|c| c.is_ascii_digit()) && !num_str.is_empty() {
+                return Some(name[..idx].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn get_volume_base(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archive");
+    if let Some(base) = extract_volume_base(name) {
+        return base;
+    }
+    if let Some(stem) = name.strip_suffix(".rar") {
+        return stem.to_string();
+    }
+    if let Some(stem) = name.strip_suffix(".RAR") {
+        return stem.to_string();
+    }
+    name.to_string()
+}
+
+fn volume_path(parent: &Path, base: &str, part_num: usize) -> PathBuf {
+    parent.join(format!("{base}.part{part_num}.rar"))
 }
 
 #[cfg(test)]
@@ -970,5 +1516,104 @@ mod tests {
             assert_eq!(ar.read("c.bin").unwrap(), (0..=255u8).collect::<Vec<_>>());
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn multivolume_create_store_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mv.rar");
+
+        // Generate test data (102400 bytes)
+        let mut rng_data = vec![0u8; 102400];
+        for (i, b) in rng_data.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(7) ^ (i >> 3)) as u8;
+        }
+        let small = b"Hello from multi-volume test\n";
+
+        {
+            let mut ar = RarArchive::create_multivolume(&path, 30000).unwrap();
+            ar.add_bytes("big.bin", &rng_data, 0).unwrap();
+            ar.add_bytes("small.txt", small, 0).unwrap();
+            ar.close().unwrap();
+        }
+
+        // Verify volumes were created
+        let vols = discover_volumes(&path);
+        assert!(vols.len() > 1, "should create multiple volumes");
+
+        // Read back
+        {
+            let mut ar = RarArchive::open(&vols[0]).unwrap();
+            let entries = ar.list().to_vec();
+            assert_eq!(entries.len(), 2);
+
+            assert_eq!(ar.read("big.bin").unwrap(), rng_data);
+            assert_eq!(ar.read("small.txt").unwrap(), small.to_vec());
+        }
+    }
+
+    #[test]
+    fn multivolume_create_compressed_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mvc.rar");
+
+        let data = b"Compressible data pattern!\n".repeat(3000);
+        let small = b"Tiny file";
+
+        {
+            let mut ar = RarArchive::create_multivolume(&path, 30000).unwrap();
+            ar.add_bytes("data.txt", &data, 3).unwrap();
+            ar.add_bytes("small.txt", small, 3).unwrap();
+            ar.close().unwrap();
+        }
+
+        let vols = discover_volumes(&path);
+        assert!(vols.len() >= 1);
+
+        {
+            let mut ar = RarArchive::open(&vols[0]).unwrap();
+            assert_eq!(ar.read("data.txt").unwrap(), data);
+            assert_eq!(ar.read("small.txt").unwrap(), small.to_vec());
+        }
+    }
+
+    #[test]
+    fn multivolume_discover_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disc.rar");
+
+        let data = vec![0u8; 50000];
+        {
+            let mut ar = RarArchive::create_multivolume(&path, 20000).unwrap();
+            ar.add_bytes("data.bin", &data, 0).unwrap();
+            ar.close().unwrap();
+        }
+
+        // Discover from part1
+        let vols = discover_volumes(&dir.path().join("disc.part1.rar"));
+        assert!(vols.len() > 1);
+
+        // Discover from part2
+        let vols2 = discover_volumes(&dir.path().join("disc.part2.rar"));
+        assert_eq!(vols2.len(), vols.len());
+        assert_eq!(vols2[0].file_name().unwrap().to_str().unwrap(), "disc.part1.rar");
+    }
+
+    #[test]
+    fn multivolume_open_from_any_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anypart.rar");
+
+        let data = vec![42u8; 80000];
+        {
+            let mut ar = RarArchive::create_multivolume(&path, 30000).unwrap();
+            ar.add_bytes("data.bin", &data, 0).unwrap();
+            ar.close().unwrap();
+        }
+
+        // Open from part2
+        let part2 = dir.path().join("anypart.part2.rar");
+        let mut ar = RarArchive::open(&part2).unwrap();
+        assert_eq!(ar.read("data.bin").unwrap(), data);
     }
 }
