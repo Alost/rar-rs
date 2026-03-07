@@ -11,9 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::codec::DecoderState;
 use crate::compression;
 use crate::constants::*;
-use crate::encryption;
+use crate::encryption::{self, parse_archive_encrypt_header};
 use crate::error::{RarError, RarResult};
 use crate::headers::*;
+use crate::vint;
 
 /// A single entry in the archive (public API).
 #[derive(Clone, Debug)]
@@ -207,15 +208,145 @@ impl RarArchive {
                 }
                 BLOCK_TYPE_END_ARCHIVE => break,
                 BLOCK_TYPE_ENCRYPT_HEADER => {
-                    return Err(RarError::Unsupported(
-                        "archive-level encryption is not yet supported".into(),
-                    ));
+                    return self.scan_encrypted_blocks(&raw);
                 }
                 _ => {}
             }
 
             if raw.data_size > 0 {
                 stream.seek(SeekFrom::Start(raw.data_offset + raw.data_size))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse the archive-level encryption header and scan all encrypted blocks.
+    ///
+    /// In header-encrypted archives, each block after the encryption header is:
+    /// `[16-byte IV] [AES-256-CBC encrypted header, padded to 16B] [file data if any]`
+    fn scan_encrypted_blocks(&mut self, encrypt_raw: &RawBlock) -> RarResult<()> {
+        let password = self.password.as_ref().ok_or_else(|| {
+            RarError::Encrypted("archive has encrypted headers; provide a password".into())
+        })?;
+
+        // Parse the encryption header to get salt, strength, etc.
+        let encr_params = parse_archive_encrypt_header(encrypt_raw)?;
+
+        if !encr_params.verify_password(password) {
+            return Err(RarError::Encrypted("wrong password".into()));
+        }
+
+        let key = encr_params.get_key(password);
+        let stream = self.stream.as_mut().unwrap();
+
+        loop {
+            // Each encrypted block: [16-byte IV] [encrypted header padded to 16B]
+            let mut iv = [0u8; 16];
+            match stream.read_exact(&mut iv) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+
+            // Read first 16 encrypted bytes to determine header size
+            let mut first_block = [0u8; 16];
+            stream.read_exact(&mut first_block)?;
+
+            let first_pt = encryption::decrypt_data(&first_block, &key, &iv)?;
+
+            // Parse CRC and header size from decrypted data
+            let _crc = u32::from_le_bytes(first_pt[0..4].try_into().unwrap());
+            let (hdr_size, vint_len) = vint::decode_from_slice(&first_pt, 4)
+                .map_err(|e| RarError::Format(format!("encrypted block vint: {e}")))?;
+
+            if hdr_size == 0 || hdr_size > 2 * 1024 * 1024 {
+                return Err(RarError::Format(format!(
+                    "implausible encrypted header size: {hdr_size}"
+                )));
+            }
+
+            // Total raw bytes = CRC(4) + vint + header_body, padded to 16B
+            let total_raw = 4 + vint_len + hdr_size as usize;
+            let enc_size = ((total_raw + 15) / 16) * 16;
+
+            // Read remaining encrypted blocks (we already have the first 16)
+            let mut full_ct = vec![0u8; enc_size];
+            full_ct[..16].copy_from_slice(&first_block);
+            if enc_size > 16 {
+                stream.read_exact(&mut full_ct[16..])?;
+            }
+
+            // Decrypt the full header
+            let full_pt = encryption::decrypt_data(&full_ct, &key, &iv)?;
+
+            // Extract just the header data (skip CRC + vint)
+            let header_data = full_pt[4 + vint_len..4 + vint_len + hdr_size as usize].to_vec();
+
+            // Verify CRC
+            let size_bytes = vint::encode(hdr_size);
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&size_bytes);
+            hasher.update(&header_data);
+            let computed_crc = hasher.finalize();
+            if computed_crc != _crc {
+                return Err(RarError::Crc {
+                    expected: _crc,
+                    actual: computed_crc,
+                    context: "encrypted block header".into(),
+                });
+            }
+
+            // Parse block type and flags from header_data
+            let mut offset = 0;
+            let (block_type, n) = vint::decode_from_slice(&header_data, offset)
+                .map_err(|e| RarError::Format(format!("block type: {e}")))?;
+            offset += n;
+            let (flags, n) = vint::decode_from_slice(&header_data, offset)
+                .map_err(|e| RarError::Format(format!("block flags: {e}")))?;
+            offset += n;
+
+            let mut _extra_size = 0u64;
+            let mut data_size = 0u64;
+            if flags & BLOCK_FLAG_EXTRA_DATA != 0 {
+                let (v, n) = vint::decode_from_slice(&header_data, offset)
+                    .map_err(|e| RarError::Format(format!("extra size: {e}")))?;
+                _extra_size = v;
+                offset += n;
+            }
+            if flags & BLOCK_FLAG_DATA_AREA != 0 {
+                let (v, n) = vint::decode_from_slice(&header_data, offset)
+                    .map_err(|e| RarError::Format(format!("data size: {e}")))?;
+                data_size = v;
+                offset += n;
+            }
+            let _ = offset;
+
+            // Build a RawBlock so we can reuse existing header parsers
+            let raw = RawBlock {
+                header_crc: _crc,
+                header_data,
+                data_size,
+                data_offset: stream.stream_position()?,
+                block_type,
+                flags,
+            };
+
+            match block_type {
+                BLOCK_TYPE_ARCHIVE_HEADER => {
+                    let _ah = ArchiveHeader::from_raw(&raw)?;
+                }
+                BLOCK_TYPE_FILE_HEADER => {
+                    let fh = FileHeader::from_raw(&raw, raw.data_offset)?;
+                    self.entries.push(ArchiveEntry { header: fh });
+                }
+                BLOCK_TYPE_END_ARCHIVE => break,
+                _ => {}
+            }
+
+            // Skip file data area if present
+            if data_size > 0 {
+                stream.seek(SeekFrom::Current(data_size as i64))?;
             }
         }
 

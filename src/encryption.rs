@@ -176,6 +176,68 @@ impl EncryptionParams {
     }
 }
 
+/// Parse the archive-level encryption header block (type 0x04).
+///
+/// The block body (after block_type and flags vints) contains:
+/// `[vint encr_version] [vint encr_flags] [u8 strength] [16-byte salt]`
+/// Optionally followed by a 12-byte password check value if encr_flags & 0x01.
+pub fn parse_archive_encrypt_header(raw: &crate::headers::RawBlock) -> RarResult<EncryptionParams> {
+    let data = &raw.header_data;
+    let mut offset = 0;
+
+    // Skip block_type and block_flags (already parsed, but stored in header_data)
+    let (_, n) = vint::decode_from_slice(data, offset)
+        .map_err(|e| RarError::Format(format!("block type: {e}")))?;
+    offset += n;
+    let (_, n) = vint::decode_from_slice(data, offset)
+        .map_err(|e| RarError::Format(format!("block flags: {e}")))?;
+    offset += n;
+
+    // Encryption-specific fields
+    let (version, n) = vint::decode_from_slice(data, offset)
+        .map_err(|e| RarError::Format(format!("encr version: {e}")))?;
+    offset += n;
+    let (flags, n) = vint::decode_from_slice(data, offset)
+        .map_err(|e| RarError::Format(format!("encr flags: {e}")))?;
+    offset += n;
+
+    if offset >= data.len() {
+        return Err(RarError::Format("truncated encryption header".into()));
+    }
+    let strength = data[offset];
+    offset += 1;
+
+    if offset + ENCR_SALT_SIZE > data.len() {
+        return Err(RarError::Format("truncated encryption header salt".into()));
+    }
+    let mut salt = [0u8; ENCR_SALT_SIZE];
+    salt.copy_from_slice(&data[offset..offset + ENCR_SALT_SIZE]);
+    offset += ENCR_SALT_SIZE;
+
+    let checksum = if flags & 0x01 != 0 && offset + 12 <= data.len() {
+        let mut ck = [0u8; 12];
+        ck.copy_from_slice(&data[offset..offset + 12]);
+        Some(ck)
+    } else {
+        None
+    };
+
+    // Archive-level encryption header doesn't have its own IV —
+    // each subsequent block carries its own IV.
+    let iv = [0u8; ENCR_IV_SIZE];
+    let iterations = 1u32 << strength;
+
+    Ok(EncryptionParams {
+        version: version as u8,
+        flags: flags as u8,
+        strength,
+        salt,
+        iv,
+        checksum,
+        iterations,
+    })
+}
+
 /// Check if a file header's extra area contains an encryption record.
 pub fn is_encrypted(extra_data: &[u8]) -> bool {
     parse_encryption_extra(extra_data)

@@ -9,18 +9,19 @@ archives with native LZSS+Huffman compression — no external binaries required.
 
 ## Features
 
-| Feature                            | Status |
-|------------------------------------|--------|
-| Create RAR5 archives               |   done |
-| Extract RAR5 archives              |   done |
-| Native LZSS+Huffman compression    |   done |
-| Compression levels 0-5             |   done |
-| CRC32 integrity verification       |   done |
-| Directory entries                  |   done |
-| Timestamp preservation             |   done |
-| Solid archive decompression        |   todo |
-| File-level AES-256 decryption      |   todo |
-| Multi-volume archives              |   todo |
+| Feature                              | Status |
+|--------------------------------------|--------|
+| Create RAR5 archives                 |   done |
+| Extract RAR5 archives                |   done |
+| Native LZSS+Huffman compression      |   done |
+| Compression levels 0-5               |   done |
+| CRC32 integrity verification         |   done |
+| Directory entries                    |   done |
+| Timestamp preservation               |   done |
+| Solid archive decompression          |   done |
+| File-level AES-256 decryption        |   done |
+| Header-encrypted archive decryption  |   done |
+| Multi-volume archives                |   todo |
 
 Archives produced by rar-rs are fully interoperable with WinRAR and unrar.
 
@@ -31,19 +32,19 @@ Archives produced by rar-rs are fully interoperable with WinRAR and unrar.
 ### rar
 
 ```
-rar a archive.rar files...     Create archive
-rar l archive.rar              List contents
-rar i archive.rar              Show info
+rar a [-m0..-m5] archive.rar files...   Create archive
+rar l archive.rar                       List contents
+rar i archive.rar                       Show info
 ```
 
 ### unrar
 
 ```
-unrar x archive.rar [dest/]    Extract with full paths
-unrar e archive.rar [dest/]    Extract flat
-unrar l archive.rar            List contents
-unrar t archive.rar            Test integrity
-unrar p archive.rar [file]     Print to stdout
+unrar x [-p<password>] archive.rar [dest/]    Extract with full paths
+unrar e [-p<password>] archive.rar [dest/]    Extract flat
+unrar l [-p<password>] archive.rar            List contents
+unrar t [-p<password>] archive.rar            Test integrity
+unrar p [-p<password>] archive.rar [file]     Print to stdout
 ```
 
 ---
@@ -66,6 +67,10 @@ rar.extract_all("/tmp/output/")?;
 // Read a single file
 let mut rar = RarArchive::open("backup.rar")?;
 let data = rar.read("notes.txt")?;
+
+// Open an encrypted archive
+let mut rar = RarArchive::open_with_password("secret.rar", "mypassword")?;
+let data = rar.read("classified.txt")?;
 ```
 
 ---
@@ -78,6 +83,7 @@ src/
 +-- archive.rs          RarArchive high-level interface
 +-- headers.rs          Block/header structs
 +-- compression.rs      Compress/decompress dispatch
++-- encryption.rs       AES-256-CBC + PBKDF2 key derivation
 +-- constants.rs        RAR5 format constants
 +-- vint.rs             Variable-length integer codec
 +-- error.rs            Error types
