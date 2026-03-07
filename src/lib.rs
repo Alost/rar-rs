@@ -27,10 +27,12 @@ pub mod archive;
 pub mod codec;
 pub mod compression;
 pub mod constants;
+pub mod encryption;
 pub mod error;
 pub mod headers;
 pub mod vint;
 
 pub use archive::{ArchiveEntry, RarArchive};
 pub use constants::*;
+pub use encryption::EncryptionParams;
 pub use error::{RarError, RarResult};

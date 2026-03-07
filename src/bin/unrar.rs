@@ -11,22 +11,37 @@ fn main() {
         process::exit(1);
     }
 
-    let result = match args[1].as_str() {
-        "x" | "extract" => cmd_extract(&args[2..]),
-        "e" => cmd_extract_flat(&args[2..]),
-        "l" | "list" => cmd_list(&args[2..]),
-        "t" | "test" => cmd_test(&args[2..]),
-        "p" | "print" => cmd_print(&args[2..]),
+    // Extract -p<password> from args
+    let mut password: Option<String> = None;
+    let mut filtered_args: Vec<String> = Vec::new();
+    for arg in &args[1..] {
+        if let Some(pw) = arg.strip_prefix("-p") {
+            password = Some(pw.to_string());
+        } else {
+            filtered_args.push(arg.clone());
+        }
+    }
+
+    if filtered_args.is_empty() {
+        usage();
+        process::exit(1);
+    }
+
+    let result = match filtered_args[0].as_str() {
+        "x" | "extract" => cmd_extract(&filtered_args[1..], password.as_deref()),
+        "e" => cmd_extract_flat(&filtered_args[1..], password.as_deref()),
+        "l" | "list" => cmd_list(&filtered_args[1..], password.as_deref()),
+        "t" | "test" => cmd_test(&filtered_args[1..], password.as_deref()),
+        "p" | "print" => cmd_print(&filtered_args[1..], password.as_deref()),
         "-h" | "--help" | "help" => {
             usage();
             Ok(())
         }
-        // If first arg looks like a rar file, default to listing
         other if other.ends_with(".rar") || other.ends_with(".cbr") => {
-            cmd_list(&args[1..])
+            cmd_list(&filtered_args, password.as_deref())
         }
         _ => {
-            eprintln!("unknown command: {}", args[1]);
+            eprintln!("unknown command: {}", filtered_args[0]);
             usage();
             process::exit(1);
         }
@@ -47,15 +62,26 @@ fn usage() {
     eprintln!("  unrar l <archive.rar>            List contents");
     eprintln!("  unrar t <archive.rar>            Test integrity");
     eprintln!("  unrar p <archive.rar> [file]     Print file to stdout");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -p<password>                     Set password for encrypted archives");
 }
 
-fn cmd_extract(args: &[String]) -> Result<(), String> {
+fn open_archive(path: &str, password: Option<&str>) -> Result<rar5::RarArchive, String> {
+    if let Some(pw) = password {
+        rar5::RarArchive::open_with_password(path, pw).map_err(|e| format!("{e}"))
+    } else {
+        rar5::RarArchive::open(path).map_err(|e| format!("{e}"))
+    }
+}
+
+fn cmd_extract(args: &[String], password: Option<&str>) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: unrar x <archive.rar> [dest/]".into());
     }
     let dest = if args.len() > 1 { &args[1] } else { "." };
 
-    let mut rar = rar5::RarArchive::open(&args[0]).map_err(|e| format!("{e}"))?;
+    let mut rar = open_archive(&args[0], password)?;
 
     let count = rar.list().len();
     rar.extract_all(dest).map_err(|e| format!("{e}"))?;
@@ -63,13 +89,13 @@ fn cmd_extract(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_extract_flat(args: &[String]) -> Result<(), String> {
+fn cmd_extract_flat(args: &[String], password: Option<&str>) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: unrar e <archive.rar> [dest/]".into());
     }
     let dest = if args.len() > 1 { &args[1] } else { "." };
 
-    let mut rar = rar5::RarArchive::open(&args[0]).map_err(|e| format!("{e}"))?;
+    let mut rar = open_archive(&args[0], password)?;
 
     let names: Vec<String> = rar.list().iter().map(|e| e.name().to_string()).collect();
     for name in &names {
@@ -89,11 +115,11 @@ fn cmd_extract_flat(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_list(args: &[String]) -> Result<(), String> {
+fn cmd_list(args: &[String], password: Option<&str>) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: unrar l <archive.rar>".into());
     }
-    let rar = rar5::RarArchive::open(&args[0]).map_err(|e| format!("{e}"))?;
+    let rar = open_archive(&args[0], password)?;
 
     println!(
         "{:>10}  {:>10}  {:>6}  {:<8}  Name",
@@ -126,11 +152,11 @@ fn cmd_list(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_test(args: &[String]) -> Result<(), String> {
+fn cmd_test(args: &[String], password: Option<&str>) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: unrar t <archive.rar>".into());
     }
-    let mut rar = rar5::RarArchive::open(&args[0]).map_err(|e| format!("{e}"))?;
+    let mut rar = open_archive(&args[0], password)?;
 
     let names: Vec<String> = rar.list().iter().map(|e| e.name().to_string()).collect();
     let mut ok = 0;
@@ -162,11 +188,11 @@ fn cmd_test(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn cmd_print(args: &[String]) -> Result<(), String> {
+fn cmd_print(args: &[String], password: Option<&str>) -> Result<(), String> {
     if args.is_empty() {
         return Err("usage: unrar p <archive.rar> [file]".into());
     }
-    let mut rar = rar5::RarArchive::open(&args[0]).map_err(|e| format!("{e}"))?;
+    let mut rar = open_archive(&args[0], password)?;
 
     if args.len() > 1 {
         let data = rar.read(&args[1]).map_err(|e| format!("{e}"))?;
@@ -175,7 +201,6 @@ fn cmd_print(args: &[String]) -> Result<(), String> {
             .write_all(&data)
             .map_err(|e| format!("{e}"))?;
     } else {
-        // Print all files
         let names: Vec<String> = rar.list().iter().map(|e| e.name().to_string()).collect();
         for name in &names {
             let entry = rar.get_entry(name).unwrap();

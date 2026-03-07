@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::codec::DecoderState;
 use crate::compression;
 use crate::constants::*;
+use crate::encryption;
 use crate::error::{RarError, RarResult};
 use crate::headers::*;
 
@@ -56,6 +57,8 @@ pub struct RarArchive {
     solid_state: Option<DecoderState>,
     /// Index of the last file decoded in the solid chain (-1 = none).
     solid_decoded_through: isize,
+    /// Password for encrypted archives.
+    password: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -78,9 +81,31 @@ impl RarArchive {
             stream: None,
             solid_state: None,
             solid_decoded_through: -1,
+            password: None,
         };
         archive.open_read()?;
         Ok(archive)
+    }
+
+    /// Open an existing RAR5 archive with a password for encrypted content.
+    pub fn open_with_password(path: impl AsRef<Path>, password: &str) -> RarResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut archive = RarArchive {
+            path,
+            mode: Mode::Read,
+            entries: Vec::new(),
+            stream: None,
+            solid_state: None,
+            solid_decoded_through: -1,
+            password: Some(password.to_string()),
+        };
+        archive.open_read()?;
+        Ok(archive)
+    }
+
+    /// Set the password for decryption.
+    pub fn set_password(&mut self, password: &str) {
+        self.password = Some(password.to_string());
     }
 
     /// Create a new RAR5 archive (overwrites existing file).
@@ -93,6 +118,7 @@ impl RarArchive {
             stream: None,
             solid_state: None,
             solid_decoded_through: -1,
+            password: None,
         };
         archive.open_write()?;
         Ok(archive)
@@ -406,12 +432,41 @@ impl RarArchive {
             return Ok(Vec::new());
         }
 
+        // Check for encryption in extra area
+        let encr_params = if !hdr.extra_data.is_empty() {
+            encryption::parse_encryption_extra(&hdr.extra_data)?
+        } else {
+            None
+        };
+
+        let is_encrypted = encr_params.is_some();
+
+        if is_encrypted && self.password.is_none() {
+            return Err(RarError::Encrypted(format!(
+                "{}: encrypted, no password set",
+                hdr.name
+            )));
+        }
+
         let stream = self.stream.as_mut().unwrap();
         stream.seek(SeekFrom::Start(hdr.data_offset))?;
         let mut packed_data = vec![0u8; hdr.packed_size as usize];
         stream.read_exact(&mut packed_data)?;
 
+        // Decrypt if encrypted
+        if let Some(ref params) = encr_params {
+            let password = self.password.as_ref().unwrap();
+            if !params.verify_password(password) {
+                return Err(RarError::Encrypted("wrong password".into()));
+            }
+            packed_data = params.decrypt(&packed_data, password)?;
+        }
+
         let raw_data = if hdr.comp_method == COMP_METHOD_STORE {
+            // For store mode, truncate to unpacked_size (strip zero-fill padding)
+            if is_encrypted {
+                packed_data.truncate(hdr.unpacked_size as usize);
+            }
             packed_data
         } else {
             compression::decompress(
@@ -424,17 +479,19 @@ impl RarArchive {
             .map_err(|e| RarError::Unsupported(e))?
         };
 
-        // Verify CRC
-        if let Some(expected_crc) = hdr.crc32_val {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&raw_data);
-            let actual_crc = hasher.finalize();
-            if actual_crc != expected_crc {
-                return Err(RarError::Crc {
-                    expected: expected_crc,
-                    actual: actual_crc,
-                    context: hdr.name.clone(),
-                });
+        // Verify CRC (skip for encrypted files — CRC is password-dependent)
+        if !is_encrypted {
+            if let Some(expected_crc) = hdr.crc32_val {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&raw_data);
+                let actual_crc = hasher.finalize();
+                if actual_crc != expected_crc {
+                    return Err(RarError::Crc {
+                        expected: expected_crc,
+                        actual: actual_crc,
+                        context: hdr.name.clone(),
+                    });
+                }
             }
         }
 
