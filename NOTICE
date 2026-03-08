@@ -1,7 +1,7 @@
 LEGAL NOTICE
 =============
 
-rar-rs is a clean-room Rust implementation of the RAR5 archive format for
+rar-rs is a clean-room Rust implementation of the RAR archive format for
 software conservancy and educational purposes, providing BSD-2-Clause licensed
 `rar` and `unrar` command-line tools.
 
@@ -14,10 +14,17 @@ libarchive's archive_read_support_format_rar5.c by Grzegorz Antoniak (2018),
 which is itself an independent BSD-2-Clause licensed implementation of a RAR5
 decompressor. No proprietary RARLAB source code was used or referenced.
 
+The RAR4 decompressor (src/rar4/) was developed as a clean-room implementation
+based on libarchive's archive_read_support_format_rar.c, which is an
+independent BSD-2-Clause licensed RAR4 reader. The RAR4 support is read-only:
+it parses RAR4 headers, decompresses LZSS+Huffman (method 3) streams, and
+applies VM filters (E8, E8E9, Delta, RGB, Audio). No RAR4 compression or
+archive creation capability is provided.
+
 This project does not contain, link to, or derive from the proprietary unrar
 source code distributed by RARLAB under its restrictive license. The archive
-header and block structure implementation is based on the publicly documented
-RAR5 format specification.
+header and block structure implementations are based on the publicly documented
+RAR format specifications and libarchive's independent BSD-2-Clause work.
 
 Scope and Limitations
 ----------------------
@@ -31,8 +38,13 @@ This software:
     Compression ratios will vary; this implementation may produce larger output
     than the native tool in many real-world scenarios.
 
+  - Provides RAR5 read/write (compress and decompress) and RAR4 read-only
+    (decompress only) support. There is no ability to create or compress RAR4
+    or RAR3 archives — only RAR5 archive creation is supported. RAR4 support
+    is limited to reading, listing, testing, and extracting existing archives.
+
   - Is intended for software conservancy, interoperability, and educational use.
-    It enables reading and writing of the RAR5 archive format without depending
+    It enables reading and writing of the RAR archive format without depending
     on proprietary binaries.
 
 Trademarks

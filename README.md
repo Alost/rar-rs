@@ -1,7 +1,8 @@
 # rar-rs
 
-Pure-Rust RAR5 archive library and tools. Creates, reads, and extracts RAR5
-archives with native LZSS+Huffman compression — no external binaries required.
+Pure-Rust RAR archive library and tools. Creates, reads, and extracts RAR5
+archives with native LZSS+Huffman compression, and reads/extracts RAR4
+archives — no external binaries required.
 
 **License:** BSD-2-Clause — see [NOTICE](NOTICE) for legal details.
 
@@ -11,6 +12,7 @@ archives with native LZSS+Huffman compression — no external binaries required.
 
 | Feature                              | Status |
 |--------------------------------------|--------|
+| **RAR5 (v5.0)**                      |        |
 | Create RAR5 archives                 |   done |
 | Extract RAR5 archives                |   done |
 | Native LZSS+Huffman compression      |   done |
@@ -24,8 +26,16 @@ archives with native LZSS+Huffman compression — no external binaries required.
 | Header-encrypted archive decryption  |   done |
 | Multi-volume archive reading         |   done |
 | Multi-volume archive creation        |   done |
+| **RAR4 (v1.5–v3.x)**                |        |
+| Extract RAR4 archives               |   done |
+| LZSS+Huffman decompression (m3)      |   done |
+| VM filters (E8, E8E9, Delta, RGB, Audio) | done |
+| Unicode filename support             |   done |
+| Large file support (>2 GB)           |   done |
 
-Archives produced by rar-rs are fully interoperable with WinRAR and unrar.
+RAR5 archives produced by rar-rs are fully interoperable with WinRAR and unrar.
+RAR4 archives created by other tools (WinRAR, 7-Zip, etc.) can be listed,
+tested, and extracted.
 
 ---
 
@@ -105,7 +115,7 @@ src/
 +-- constants.rs        RAR5 format constants
 +-- vint.rs             Variable-length integer codec
 +-- error.rs            Error types
-+-- codec/
++-- codec/              RAR5 compression codec
 |   +-- mod.rs          Codec public API
 |   +-- decoder.rs      Block decoder + symbol stream
 |   +-- encoder.rs      Block encoder + match finder
@@ -115,6 +125,11 @@ src/
 |   +-- filters.rs      Delta, E8, E8E9, ARM filters
 |   +-- lz_match.rs     Hash-chain match finder
 |   +-- tables.rs       Symbol/table constants
++-- rar4/               RAR4 read/extract support
+|   +-- mod.rs          Module root
+|   +-- constants.rs    RAR4 header types and flags
+|   +-- headers.rs      RAR4 header parsing
+|   +-- decoder.rs      LZSS+Huffman decompressor + VM filters
 +-- bin/
     +-- rar.rs          CLI archive creator
     +-- unrar.rs        CLI archive extractor
