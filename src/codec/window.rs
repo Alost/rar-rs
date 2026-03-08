@@ -25,6 +25,11 @@ impl SlidingWindow {
     }
 
     #[inline]
+    pub fn size(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[inline]
     pub fn total_written(&self) -> u64 {
         self.total_written
     }

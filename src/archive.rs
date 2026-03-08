@@ -1,4 +1,4 @@
-/// RarArchive — high-level RAR5 archive interface.
+/// RarArchive — high-level RAR4/RAR5 archive interface.
 ///
 /// Supports opening existing archives for reading/extraction and creating
 /// new archives from scratch.
@@ -14,6 +14,7 @@ use crate::constants::*;
 use crate::encryption::{self, parse_archive_encrypt_header};
 use crate::error::{RarError, RarResult};
 use crate::headers::*;
+use crate::rar4;
 use crate::vint;
 
 /// A single entry in the archive (public API).
@@ -49,14 +50,18 @@ impl ArchiveEntry {
     }
 }
 
-/// RAR5 archive reader/writer.
+/// RAR4/RAR5 archive reader/writer.
 pub struct RarArchive {
     path: PathBuf,
     mode: Mode,
     entries: Vec<ArchiveEntry>,
     stream: Option<File>,
-    /// Persistent decoder state for solid archive chains.
+    /// Archive format version (4 or 5).
+    format_version: u8,
+    /// Persistent decoder state for RAR5 solid archive chains.
     solid_state: Option<DecoderState>,
+    /// Persistent decoder state for RAR4 solid archive chains.
+    rar4_solid_state: Option<rar4::decoder::Rar4DecoderState>,
     /// Index of the last file decoded in the solid chain (-1 = none).
     solid_decoded_through: isize,
     /// Password for encrypted archives.
@@ -89,7 +94,9 @@ impl RarArchive {
             mode: Mode::Read,
             entries: Vec::new(),
             stream: None,
+            format_version: 5,
             solid_state: None,
+            rar4_solid_state: None,
             solid_decoded_through: -1,
             password: None,
             volume_paths: Vec::new(),
@@ -109,7 +116,9 @@ impl RarArchive {
             mode: Mode::Read,
             entries: Vec::new(),
             stream: None,
+            format_version: 5,
             solid_state: None,
+            rar4_solid_state: None,
             solid_decoded_through: -1,
             password: Some(password.to_string()),
             volume_paths: Vec::new(),
@@ -134,7 +143,9 @@ impl RarArchive {
             mode: Mode::Write,
             entries: Vec::new(),
             stream: None,
+            format_version: 5,
             solid_state: None,
+            rar4_solid_state: None,
             solid_decoded_through: -1,
             password: None,
             volume_paths: Vec::new(),
@@ -156,7 +167,9 @@ impl RarArchive {
             mode: Mode::Write,
             entries: Vec::new(),
             stream: None,
+            format_version: 5,
             solid_state: None,
+            rar4_solid_state: None,
             solid_decoded_through: -1,
             password: None,
             volume_paths: vec![vol_path.clone()],
@@ -218,22 +231,26 @@ impl RarArchive {
         let stream = self.stream.as_mut().unwrap();
         let mut sig = [0u8; 8];
         let n = stream.read(&mut sig)?;
-        if n < 8 {
+        if n < 7 {
             return Err(RarError::Format(format!(
                 "file too short to be a RAR archive ({n} bytes read)"
             )));
         }
-        if sig[..7] == *RAR4_SIGNATURE && sig != *RAR5_SIGNATURE {
-            return Err(RarError::Unsupported(
-                "RAR4 format detected; rar-rs only supports RAR5".into(),
-            ));
+        if sig == *RAR5_SIGNATURE {
+            self.format_version = 5;
+            return Ok(());
         }
-        if sig != *RAR5_SIGNATURE {
-            return Err(RarError::Format(format!(
-                "not a RAR5 archive (bad signature: {sig:?})"
-            )));
+        if sig[..7] == *RAR4_SIGNATURE {
+            self.format_version = 4;
+            // RAR4 signature is 7 bytes; seek back 1 byte since we read 8
+            if n == 8 {
+                stream.seek(SeekFrom::Current(-1))?;
+            }
+            return Ok(());
         }
-        Ok(())
+        Err(RarError::Format(format!(
+            "not a RAR archive (bad signature: {sig:?})"
+        )))
     }
 
     fn write_signature(&mut self) -> RarResult<()> {
@@ -246,6 +263,11 @@ impl RarArchive {
 
     fn scan_blocks(&mut self) -> RarResult<()> {
         self.entries.clear();
+
+        if self.format_version == 4 {
+            return self.scan_rar4_blocks();
+        }
+
         let stream = self.stream.as_mut().unwrap();
 
         loop {
@@ -428,6 +450,66 @@ impl RarArchive {
             // Skip file data area if present
             if data_size > 0 {
                 stream.seek(SeekFrom::Current(data_size as i64))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Scan a RAR4 archive's blocks, building entries.
+    fn scan_rar4_blocks(&mut self) -> RarResult<()> {
+        use rar4::constants::*;
+        use rar4::headers::*;
+
+        let stream = self.stream.as_mut().unwrap();
+
+        loop {
+            let header_start = stream.stream_position()?;
+            let common = match Rar4CommonHeader::read_from(stream) {
+                Ok(c) => c,
+                Err(RarError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            };
+
+            match common.header_type {
+                RAR4_HEAD_MARK => {
+                    // Signature marker — already verified, skip to end of header
+                    let end = header_start + common.header_size as u64;
+                    stream.seek(SeekFrom::Start(end))?;
+                }
+                RAR4_HEAD_MAIN => {
+                    let main_hdr = Rar4MainHeader::parse(&common, stream, header_start)?;
+                    if main_hdr.is_encrypted {
+                        return Err(RarError::Unsupported(
+                            "RAR4 encrypted archives not yet supported".into(),
+                        ));
+                    }
+                }
+                RAR4_HEAD_FILE | RAR4_HEAD_NEWSUB => {
+                    // Seek back to right after the 7-byte common header
+                    stream.seek(SeekFrom::Start(header_start + 7))?;
+                    let (fh, chunk) = parse_rar4_file_header(&common, stream, header_start)?;
+
+                    // Skip past packed data
+                    let data_end = fh.data_offset + fh.packed_size;
+                    stream.seek(SeekFrom::Start(data_end))?;
+
+                    if common.header_type == RAR4_HEAD_NEWSUB {
+                        // Sub-blocks (service data) — skip
+                        continue;
+                    }
+
+                    self.entries.push(ArchiveEntry {
+                        header: fh,
+                        chunks: vec![chunk],
+                    });
+                }
+                RAR4_HEAD_ENDARC => break,
+                _ => {
+                    // Skip unknown or unneeded headers (COMM, AV, SUB, PROTECT, SIGN)
+                    let end = header_start + common.header_size as u64 + common.add_size as u64;
+                    stream.seek(SeekFrom::Start(end))?;
+                }
             }
         }
 
@@ -721,15 +803,25 @@ impl RarArchive {
             // Already decoded this file — but we don't cache the output,
             // so we must restart from the beginning.
             self.solid_state = None;
+            self.rar4_solid_state = None;
             self.solid_decoded_through = -1;
         } else {
             // Starting fresh
             self.solid_state = None;
+            self.rar4_solid_state = None;
             self.solid_decoded_through = -1;
         }
 
+        let is_rar4 = self.entries[chain_start].header.format_version == 4;
+
         // Determine dict_size from the first compressed entry in the chain
-        if self.solid_state.is_none() {
+        if is_rar4 {
+            if self.rar4_solid_state.is_none() {
+                self.rar4_solid_state = Some(
+                    rar4::decoder::Rar4DecoderState::new(rar4::constants::RAR4_DEFAULT_DICT_SIZE),
+                );
+            }
+        } else if self.solid_state.is_none() {
             let dict_log = self.entries[chain_start].header.comp_dict_size;
             let dict_log32 = dict_log.max(0) as u32;
             let mut dict_size = 128 * 1024 * (1usize << dict_log32);
@@ -748,10 +840,16 @@ impl RarArchive {
                 continue;
             }
 
-            // Temporarily take state to satisfy borrow checker
-            let mut state = self.solid_state.take().unwrap();
-            let data = self.decode_file_at(i, Some(&mut state))?;
-            self.solid_state = Some(state);
+            let data = if is_rar4 {
+                // RAR4 solid: decode_file_at picks up rar4_solid_state directly
+                self.decode_file_at(i, None)?
+            } else {
+                // RAR5 solid: temporarily take state to satisfy borrow checker
+                let mut state = self.solid_state.take().unwrap();
+                let data = self.decode_file_at(i, Some(&mut state))?;
+                self.solid_state = Some(state);
+                data
+            };
 
             self.solid_decoded_through = i as isize;
 
@@ -893,6 +991,19 @@ impl RarArchive {
 
         let raw_data = if hdr.comp_method == COMP_METHOD_STORE {
             packed_data
+        } else if hdr.format_version == 4 {
+            // RAR4 decompression
+            if hdr.comp_method >= 4 {
+                return Err(RarError::Unsupported(
+                    "RAR4 PPMd compression not yet supported".into(),
+                ));
+            }
+            rar4::decoder::rar4_decompress(
+                &packed_data,
+                hdr.unpacked_size,
+                self.rar4_solid_state.as_mut(),
+            )
+            .map_err(|e| RarError::Unsupported(e))?
         } else {
             compression::decompress(
                 &packed_data,

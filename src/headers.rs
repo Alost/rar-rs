@@ -230,7 +230,7 @@ pub struct DataChunk {
 
 // ── File Header ────────────────────────────────────────────────────────────
 
-/// RAR5 File Header (block type 0x02).
+/// File Header (RAR4 block type 0x74, RAR5 block type 0x02).
 #[derive(Clone, Debug)]
 pub struct FileHeader {
     pub name: String,
@@ -249,6 +249,8 @@ pub struct FileHeader {
     pub extra_data: Vec<u8>,
     pub is_directory: bool,
     pub data_offset: u64,
+    /// Archive format version (4 or 5).
+    pub format_version: u8,
 }
 
 impl Default for FileHeader {
@@ -270,6 +272,7 @@ impl Default for FileHeader {
             extra_data: Vec::new(),
             is_directory: false,
             data_offset: 0,
+            format_version: 5,
         }
     }
 }
@@ -451,6 +454,7 @@ impl FileHeader {
             extra_data,
             is_directory,
             data_offset: stream_pos,
+            format_version: 5,
         })
     }
 }
