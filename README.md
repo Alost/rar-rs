@@ -1,5 +1,7 @@
 # rar-rs
 
+fork from [https://codeberg.org/librar/rar-rs](https://codeberg.org/librar/rar-rs)
+
 Pure-Rust RAR archive library and tools. Creates, reads, and extracts RAR5
 archives with native LZSS+Huffman compression, and reads/extracts RAR4
 archives — no external binaries required.
